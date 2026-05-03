@@ -15,7 +15,7 @@ local default_config = {
         openai = 'https://api.openai.com/v1/chat/completions',
     },
     model = {
-        anthropic = 'claude-3-5-haiku-20241022',
+        anthropic = 'claude-haiku-4-5',
         openai = 'gpt-4o',
     },
     max_tokens = 4000,
