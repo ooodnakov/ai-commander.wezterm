@@ -214,6 +214,7 @@ end
 
 -- Function to process a prompt with optional context
 local function process_prompt_with_context(prompt, context, window, pane)
+    wezterm.log_info("[ai-commander] process_prompt_with_context called, prompt=" .. tostring(prompt))
     save_prompt_to_history(prompt)
 
     local api_prompt = table.concat({
@@ -257,8 +258,10 @@ local function process_prompt_with_context(prompt, context, window, pane)
         api_prompt = api_prompt .. '\n\nContext (text selected in terminal):\n' .. context
     end
 
+    wezterm.log_info("[ai-commander] calling AI API...")
     call_ai_api(config.system_prompt, api_prompt, function(response)
-        wezterm.log_info("AI response:\n" .. response)
+        wezterm.log_info("[ai-commander] AI response length=" .. #response)
+        wezterm.log_info("[ai-commander] AI response:\n" .. response)
 
         -- Parse response into command + description pairs
         -- Description lines start with "## ". Everything between descriptions is the command
@@ -490,6 +493,7 @@ end
 
 -- Expose function for showing prompt input
 function M.show_prompt(window, pane)
+    wezterm.log_info("[ai-commander] show_prompt called")
     -- Get selected text as context
     local selection = window:get_selection_text_for_pane(pane)
     local context_description = ""
@@ -504,6 +508,7 @@ function M.show_prompt(window, pane)
         act.PromptInputLine {
             description = context_description,
             action = wezterm.action_callback(function(window, pane, line)
+                wezterm.log_info("[ai-commander] PromptInputLine callback, line=" .. tostring(line))
                 if not line then
                     return
                 end
