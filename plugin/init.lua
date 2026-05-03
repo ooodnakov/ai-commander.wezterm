@@ -258,6 +258,8 @@ local function process_prompt_with_context(prompt, context, window, pane)
     end
 
     call_ai_api(config.system_prompt, api_prompt, function(response)
+        wezterm.log_info("AI response:\n" .. response)
+
         -- Parse response into command + description pairs
         -- Description lines start with "## ". Everything between descriptions is the command
         -- (which may span multiple lines for heredocs, pipelines, etc.)
@@ -294,6 +296,11 @@ local function process_prompt_with_context(prompt, context, window, pane)
         if #current_lines > 0 then
             local cmd = table.concat(current_lines, "\n")
             table.insert(commands, { cmd = cmd, desc = nil })
+        end
+
+        wezterm.log_info("Parsed " .. #commands .. " commands")
+        for ci, c in ipairs(commands) do
+            wezterm.log_info("  cmd[" .. ci .. "]: " .. c.cmd:sub(1, 80) .. (c.desc and (" | " .. c.desc) or ""))
         end
 
         if #commands == 0 then
