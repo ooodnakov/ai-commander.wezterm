@@ -220,19 +220,31 @@ local function process_prompt_with_context(prompt, context, window, pane)
         '- Output each option as exactly two lines: the command on the first line, a short description on the second line',
         '- Separate each option with a blank line',
         '- No numbering, no markdown, no code fences, no other formatting',
-        '- The description line must start with "# " and be a brief explanation (under 80 chars)',
+        '- The description line must start with "## " and be a brief explanation (under 80 chars)',
         '- Use the most appropriate tool for the job (see your expertise above)',
         '- Prefer idempotent and non-destructive approaches where possible',
         '- If a command is potentially destructive or irreversible, note it in the description',
         '- Use realistic values instead of placeholder variables like <your-value> wherever possible',
         '- Commands must be ready to paste and run in a terminal without modification',
+        '- Multi-line commands (heredocs, pipelines with backslash continuations) are allowed; they count as one option',
+        '- IMPORTANT: the "## " description line must come AFTER the complete command (including all heredoc/continuation lines)',
         '',
         'Example output format:',
         'docker ps -a --format "table {{.ID}}\\t{{.Names}}\\t{{.Status}}"',
-        '# List all containers with ID, name and status in a table',
+        '## List all containers with ID, name and status in a table',
         '',
-        'docker container ls --all --filter status=exited',
-        '# Show only stopped/exited containers',
+        'kubectl apply -f - <<EOF',
+        'apiVersion: v1',
+        'kind: Pod',
+        'metadata:',
+        '  name: netshoot',
+        'spec:',
+        '  containers:',
+        '  - name: netshoot',
+        '    image: nicolaka/netshoot',
+        '    command: ["sleep", "infinity"]',
+        'EOF',
+        '## Create a netshoot debugging pod via heredoc manifest',
     }, '\n')
 
     -- Add context if available
@@ -242,63 +254,77 @@ local function process_prompt_with_context(prompt, context, window, pane)
 
     call_ai_api(config.system_prompt, api_prompt, function(response)
         -- Parse response into command + description pairs
-        -- Format: command line, then optional "# description" line, separated by blank lines
+        -- Description lines start with "## ". Everything between descriptions is the command
+        -- (which may span multiple lines for heredocs, pipelines, etc.)
         local commands = {}
-        local lines = {}
-        for line in response:gmatch("[^\r\n]+") do
-            local trimmed = line:match("^%s*(.-)%s*$")
-            if trimmed and trimmed ~= "" then
-                table.insert(lines, trimmed)
+        local current_lines = {}
+
+        for line in (response .. "\n"):gmatch("([^\r\n]*)\r?\n") do
+            local desc_match = line:match("^##%s+(.*)")
+            if desc_match then
+                -- This is a description line; everything accumulated so far is the command
+                if #current_lines > 0 then
+                    -- Join command lines, trim trailing blank lines
+                    while #current_lines > 0 and current_lines[#current_lines]:match("^%s*$") do
+                        table.remove(current_lines)
+                    end
+                    if #current_lines > 0 then
+                        local cmd = table.concat(current_lines, "\n")
+                        table.insert(commands, { cmd = cmd, desc = desc_match })
+                    end
+                end
+                current_lines = {}
+            else
+                -- Accumulate command lines (skip leading blank lines between commands)
+                if #current_lines > 0 or not line:match("^%s*$") then
+                    table.insert(current_lines, line)
+                end
             end
         end
 
-        local i = 1
-        while i <= #lines do
-            local line = lines[i]
-            -- Skip lines that are only comments/descriptions without a preceding command
-            if not line:match("^#") then
-                local cmd = line
-                local desc = nil
-                -- Check if next line is a description (starts with "# ")
-                if i + 1 <= #lines and lines[i + 1]:match("^#%s*") then
-                    desc = lines[i + 1]:gsub("^#%s*", "")
-                    i = i + 2
-                else
-                    i = i + 1
-                end
-                table.insert(commands, { cmd = cmd, desc = desc })
-            else
-                i = i + 1
-            end
+        -- Handle trailing command without a description
+        while #current_lines > 0 and current_lines[#current_lines]:match("^%s*$") do
+            table.remove(current_lines)
+        end
+        if #current_lines > 0 then
+            local cmd = table.concat(current_lines, "\n")
+            table.insert(commands, { cmd = cmd, desc = nil })
         end
 
         if #commands == 0 then
             pane:send_text("# Error: No commands generated")
             return
         elseif #commands == 1 then
-            -- If only one command, print it without executing
+            -- If only one command, send it without showing selector
             pane:send_text(commands[1].cmd)
             return
         end
 
-        -- Build choices with styled multiline labels
+        -- Build choices with styled labels: command + inline description
         local choices = {}
         for idx, entry in ipairs(commands) do
+            -- For display in the single-line InputSelector, show first line of command + description
+            local first_line = entry.cmd:match("^([^\n]*)")
+            local is_multiline = entry.cmd:find("\n") ~= nil
             local label
+
             if entry.desc then
                 label = wezterm.format {
-                    { Attribute = { Intensity = 'Bold' } },
                     { Foreground = { AnsiColor = 'Green' } },
-                    { Text = entry.cmd },
+                    { Attribute = { Intensity = 'Bold' } },
+                    { Text = first_line .. (is_multiline and ' ...' or '') },
                     'ResetAttributes',
+                    { Foreground = { AnsiColor = 'Fuchsia' } },
+                    { Text = '  \u{2502} ' },
                     { Foreground = { AnsiColor = 'Silver' } },
-                    { Text = '\n   ' .. entry.desc },
+                    { Attribute = { Italic = true } },
+                    { Text = entry.desc },
                 }
             else
                 label = wezterm.format {
-                    { Attribute = { Intensity = 'Bold' } },
                     { Foreground = { AnsiColor = 'Green' } },
-                    { Text = entry.cmd },
+                    { Attribute = { Intensity = 'Bold' } },
+                    { Text = first_line .. (is_multiline and ' ...' or '') },
                 }
             end
             table.insert(choices, {
