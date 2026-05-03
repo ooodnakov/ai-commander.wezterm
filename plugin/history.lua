@@ -1,4 +1,4 @@
-local cfg = _G._ai_commander_load('config')
+local cfg = require 'config'
 
 local M = {}
 

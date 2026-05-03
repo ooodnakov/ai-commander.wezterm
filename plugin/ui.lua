@@ -1,8 +1,8 @@
 local wezterm = require 'wezterm'
 local act = wezterm.action
-local cfg = _G._ai_commander_load('config')
-local history = _G._ai_commander_load('history')
-local provider = _G._ai_commander_load('provider')
+local cfg = require 'config'
+local history = require 'history'
+local provider = require 'provider'
 
 local M = {}
 
