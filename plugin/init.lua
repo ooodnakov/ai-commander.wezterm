@@ -357,45 +357,6 @@ function M.apply_to_config(wezterm_config, plugin_config)
             end
         end
     end
-
-    -- Register default keybindings
-    if not wezterm_config.keys then
-        wezterm_config.keys = {}
-    end
-
-    -- Alt+Shift+X: New AI prompt
-    table.insert(wezterm_config.keys, {
-        key = 'X',
-        mods = 'ALT|SHIFT',
-        action = wezterm.action_callback(function(window, pane)
-            M.show_prompt(window, pane)
-        end),
-    })
-
-    -- Ctrl+Shift+X: Show last AI results
-    table.insert(wezterm_config.keys, {
-        key = 'X',
-        mods = 'CTRL|SHIFT',
-        action = wezterm.action_callback(function(window, pane)
-            M.show_last_results(window, pane)
-        end),
-    })
-
-    -- Alt+Shift+H: Prompt history
-    table.insert(wezterm_config.keys, {
-        key = 'H',
-        mods = 'ALT|SHIFT',
-        action = wezterm.action_callback(function(window, pane)
-            M.show_history(window, pane)
-        end),
-    })
-
-    -- Alt+Backspace: Word deletion
-    table.insert(wezterm_config.keys, {
-        key = 'Backspace',
-        mods = 'ALT',
-        action = act.SendKey { key = 'w', mods = 'CTRL' },
-    })
 end
 
 -- Expose function for showing prompt history

@@ -27,33 +27,41 @@ Integrates with AI providers (Anthropic Claude and OpenAI GPT) to generate and s
    ```lua
    local wezterm = require 'wezterm'
    local config = wezterm.config_builder()
+   local act = wezterm.action
 
    -- Load AI Commander plugin
-   local ai_plugin = wezterm.plugin.require("https://github.com/dimao/ai-commander.wezterm")
+   local ai = wezterm.plugin.require("https://github.com/dimao/ai-commander.wezterm")
 
    -- Apply AI Commander configuration with your API key
-   -- This also registers all default keybindings automatically
-   ai_plugin.apply_to_config(config, {
+   ai.apply_to_config(config, {
      provider = "anthropic",  -- "anthropic" or "openai"
      api_key = {
-       anthropic = "your-anthropic-api-key-here",  -- Replace with your actual API key
-       openai = "your-openai-api-key-here"        -- Replace with your actual API key
+       anthropic = "your-anthropic-api-key-here",
+       openai = "your-openai-api-key-here",
      }
    })
+
+   -- Keybindings
+   config.keys = {
+     -- AI Commander
+     { key = 'X', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_prompt(w, p) end) },
+     { key = 'X', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_last_results(w, p) end) },
+     { key = 'H', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_history(w, p) end) },
+     { key = 'Backspace', mods = 'ALT', action = act.SendKey { key = 'w', mods = 'CTRL' } },
+   }
 
    return config
    ```
 
 ## Usage
 
-The plugin automatically registers the following keybindings via `apply_to_config`:
+The plugin exposes the following functions for keybinding:
 
-| Keybinding | Action |
-|---|---|
-| **Alt+Shift+X** | New AI prompt — generate commands from natural language |
-| **Ctrl+Shift+X** | Recall last results — browse and select from previous AI results |
-| **Alt+Shift+H** | Prompt history — reuse a previous prompt |
-| **Alt+Backspace** | Word deletion (sends Ctrl+W) |
+| Function | Suggested keybinding | Action |
+|---|---|---|
+| `show_prompt(w, p)` | **Alt+Shift+X** | New AI prompt — generate commands from natural language |
+| `show_last_results(w, p)` | **Ctrl+Shift+X** | Recall last results — browse and select from previous AI results |
+| `show_history(w, p)` | **Alt+Shift+H** | Prompt history — reuse a previous prompt |
 
 ### Workflow
 
@@ -178,9 +186,8 @@ ai_plugin.apply_to_config(config, {
    - Check if there are any firewall restrictions
 
 3. **Keybindings not working**
-   - Ensure `apply_to_config` is called before `return config` in your `.wezterm.lua`
+   - Ensure you've added the keybindings to your `config.keys` table as shown in the installation example
    - Check for conflicts with other keybindings in your config
-   - If you define `config.keys = { ... }` **after** `apply_to_config`, it will overwrite the plugin's keybindings; use `table.insert` instead, or define your keys before calling the plugin
 
 4. **Plugin not loading**
    - Ensure the plugin directory structure is correct
