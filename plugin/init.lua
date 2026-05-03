@@ -212,6 +212,34 @@ local function call_ai_api(system_message, user_message, callback)
     end
 end
 
+-- Helper to build a styled label for a command entry
+local function build_command_label(entry)
+    local first_line = entry.cmd:match("^([^\n]*)")
+    local is_multiline = entry.cmd:find("\n") ~= nil
+    local label
+
+    if entry.desc then
+        label = wezterm.format {
+            { Foreground = { AnsiColor = 'Green' } },
+            { Attribute = { Intensity = 'Bold' } },
+            { Text = first_line .. (is_multiline and ' ...' or '') },
+            'ResetAttributes',
+            { Foreground = { AnsiColor = 'Fuchsia' } },
+            { Text = '  \u{2502} ' },
+            { Foreground = { AnsiColor = 'Silver' } },
+            { Attribute = { Italic = true } },
+            { Text = entry.desc },
+        }
+    else
+        label = wezterm.format {
+            { Foreground = { AnsiColor = 'Green' } },
+            { Attribute = { Intensity = 'Bold' } },
+            { Text = first_line .. (is_multiline and ' ...' or '') },
+        }
+    end
+    return label
+end
+
 -- Function to process a prompt with optional context
 local function process_prompt_with_context(prompt, context, window, pane)
     wezterm.log_info("[ai-commander] process_prompt_with_context called, prompt=" .. tostring(prompt))
@@ -405,34 +433,6 @@ function M.show_history(window, pane)
         },
         pane
     )
-end
-
--- Helper to build a styled label for a command entry
-local function build_command_label(entry)
-    local first_line = entry.cmd:match("^([^\n]*)")
-    local is_multiline = entry.cmd:find("\n") ~= nil
-    local label
-
-    if entry.desc then
-        label = wezterm.format {
-            { Foreground = { AnsiColor = 'Green' } },
-            { Attribute = { Intensity = 'Bold' } },
-            { Text = first_line .. (is_multiline and ' ...' or '') },
-            'ResetAttributes',
-            { Foreground = { AnsiColor = 'Fuchsia' } },
-            { Text = '  \u{2502} ' },
-            { Foreground = { AnsiColor = 'Silver' } },
-            { Attribute = { Italic = true } },
-            { Text = entry.desc },
-        }
-    else
-        label = wezterm.format {
-            { Foreground = { AnsiColor = 'Green' } },
-            { Attribute = { Intensity = 'Bold' } },
-            { Text = first_line .. (is_multiline and ' ...' or '') },
-        }
-    end
-    return label
 end
 
 -- Expose function for showing last AI results
