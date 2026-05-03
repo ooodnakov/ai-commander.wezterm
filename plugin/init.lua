@@ -212,27 +212,38 @@ local function call_ai_api(system_message, user_message, callback)
     end
 end
 
+-- Syntax-highlight a bash command string using bat (if available)
+-- Returns the string with ANSI escape codes, or the original string as fallback
+local function highlight_bash(text)
+    local success, stdout, stderr = wezterm.run_child_process {
+        'bash', '-c', 'printf %s ' .. wezterm.shell_quote_arg(text) .. ' | bat --language=bash --color=always --style=plain --paging=never 2>/dev/null',
+    }
+    if success and stdout and #stdout > 0 then
+        -- Remove trailing newline that bat adds
+        return stdout:gsub("[\r\n]+$", "")
+    end
+    return text
+end
+
 -- Helper to build a styled label for a command entry
 local function build_command_label(entry)
     local first_line = entry.cmd:match("^([^\n]*)")
     local is_multiline = entry.cmd:find("\n") ~= nil
+    local highlighted = highlight_bash(first_line)
     local label
 
     if entry.desc then
-        label = wezterm.format {
-            { Attribute = { Intensity = 'Bold' } },
-            { Text = first_line .. (is_multiline and ' ...' or '') },
-            'ResetAttributes',
-            { Foreground = { AnsiColor = 'Silver' } },
-            { Text = '  \u{2502} ' },
-            { Attribute = { Italic = true } },
-            { Text = entry.desc },
-        }
+        label = highlighted
+            .. (is_multiline and ' ...' or '')
+            .. wezterm.format {
+                'ResetAttributes',
+                { Foreground = { AnsiColor = 'Silver' } },
+                { Text = '  \u{2502} ' },
+                { Attribute = { Italic = true } },
+                { Text = entry.desc },
+            }
     else
-        label = wezterm.format {
-            { Attribute = { Intensity = 'Bold' } },
-            { Text = first_line .. (is_multiline and ' ...' or '') },
-        }
+        label = highlighted .. (is_multiline and ' ...' or '')
     end
     return label
 end
