@@ -1,4 +1,4 @@
-local cfg = require 'plugin.config'
+local cfg = _G._ai_commander_load('config')
 
 local M = {}
 

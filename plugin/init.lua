@@ -1,8 +1,23 @@
 -- AI Commander for WezTerm
 -- Entry point: loads submodules and re-exports the public API
 
-local cfg = require 'plugin.config'
-local ui = require 'plugin.ui'
+-- Resolve the plugin directory from this file's location
+local this_dir = debug.getinfo(1, 'S').source:match('@?(.*/)') or './'
+
+-- Cached dofile loader to ensure each module is loaded only once (singleton)
+local _loaded = {}
+local function load_module(name)
+    if not _loaded[name] then
+        _loaded[name] = dofile(this_dir .. name .. '.lua')
+    end
+    return _loaded[name]
+end
+
+-- Store the loader globally so submodules can use it
+_G._ai_commander_load = load_module
+
+local cfg = load_module('config')
+local ui = load_module('ui')
 
 local M = {}
 
