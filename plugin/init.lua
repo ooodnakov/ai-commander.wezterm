@@ -220,19 +220,16 @@ local function build_command_label(entry)
 
     if entry.desc then
         label = wezterm.format {
-            { Foreground = { AnsiColor = 'Green' } },
             { Attribute = { Intensity = 'Bold' } },
             { Text = first_line .. (is_multiline and ' ...' or '') },
             'ResetAttributes',
-            { Foreground = { AnsiColor = 'Fuchsia' } },
-            { Text = '  \u{2502} ' },
             { Foreground = { AnsiColor = 'Silver' } },
+            { Text = '  \u{2502} ' },
             { Attribute = { Italic = true } },
             { Text = entry.desc },
         }
     else
         label = wezterm.format {
-            { Foreground = { AnsiColor = 'Green' } },
             { Attribute = { Intensity = 'Bold' } },
             { Text = first_line .. (is_multiline and ' ...' or '') },
         }
