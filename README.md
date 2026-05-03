@@ -7,8 +7,9 @@ Integrates with AI providers (Anthropic Claude and OpenAI GPT) to generate and s
 ## Features
 
 - **Command Generation**: Generate multiple bash command options from natural language descriptions
-- **Interactive Selection**: Choose from generated commands using a selection menu
+- **Interactive Selection**: Choose from generated commands using a styled selection menu with descriptions
 - **Context-Aware Generation**: Select text in the terminal to provide context for command generation
+- **Results Recall**: Recall previous AI-generated commands with `Ctrl+Shift+X` — no need to re-query
 - **Prompt History**: Access and reuse previous prompts with `Alt+Shift+H`
 - **Quick Command Generation**: Generate commands on-the-fly with `Alt+Shift+X`
 - **Word Deletion**: Enhanced text editing with `Alt+Backspace` for word deletion
@@ -26,12 +27,12 @@ Integrates with AI providers (Anthropic Claude and OpenAI GPT) to generate and s
    ```lua
    local wezterm = require 'wezterm'
    local config = wezterm.config_builder()
-   local act = wezterm.action
 
    -- Load AI Commander plugin
    local ai_plugin = wezterm.plugin.require("https://github.com/dimao/ai-commander.wezterm")
 
    -- Apply AI Commander configuration with your API key
+   -- This also registers all default keybindings automatically
    ai_plugin.apply_to_config(config, {
      provider = "anthropic",  -- "anthropic" or "openai"
      api_key = {
@@ -40,44 +41,19 @@ Integrates with AI providers (Anthropic Claude and OpenAI GPT) to generate and s
      }
    })
 
-   -- Your existing keybindings
-   config.keys = {
-     -- Your other keybindings here...
-     
-     -- AI Commander keybindings (add these to your existing keys table)
-     {
-       key = 'Backspace',
-       mods = 'ALT',
-       action = act.SendKey { key = 'w', mods = 'CTRL' },
-     },
-     {
-       key = 'H',
-       mods = 'ALT|SHIFT',
-       action = wezterm.action_callback(function(window, pane)
-         ai_plugin.show_history(window, pane)
-       end),
-     },
-     {
-       key = 'X',
-       mods = 'ALT|SHIFT',
-       action = wezterm.action_callback(function(window, pane)
-         ai_plugin.show_prompt(window, pane)
-       end),
-     },
-   }
-   
    return config
    ```
 
 ## Usage
 
-The plugin provides the following keybindings (which you need to add to your config):
+The plugin automatically registers the following keybindings via `apply_to_config`:
 
-- **Alt+Shift+X**: Generate bash commands from a prompt
-- **Alt+Shift+H**: Access prompt history
-- **Alt+Backspace**: Delete word (enhanced text editing)
-
-**Note**: The keybindings are not automatically registered by the plugin. You must add them to your `config.keys` table as shown in the installation example above.
+| Keybinding | Action |
+|---|---|
+| **Alt+Shift+X** | New AI prompt — generate commands from natural language |
+| **Ctrl+Shift+X** | Recall last results — browse and select from previous AI results |
+| **Alt+Shift+H** | Prompt history — reuse a previous prompt |
+| **Alt+Backspace** | Word deletion (sends Ctrl+W) |
 
 ### Workflow
 
@@ -102,6 +78,17 @@ The plugin provides the following keybindings (which you need to add to your con
 - Select log entries and ask "parse this data"
 - Select directory listing and ask "find largest files"
 
+### Recall Previous Results
+
+After generating commands, you can recall them without re-querying the AI:
+
+1. Press `Ctrl+Shift+X` to open the results recall panel
+2. Browse commands from your recent prompts, grouped by prompt text
+3. Select a command to insert it into the terminal
+4. Results are stored in memory (up to 5 recent prompts by default)
+
+This is useful when you generated several options, executed one, and want to go back and try another.
+
 ### Prompt History
 
 Access your previous prompts with `Alt+Shift+H`:
@@ -123,6 +110,7 @@ ai_plugin.apply_to_config(config, {
   max_tokens = 4000,  -- Maximum response length
   temperature = 0.1,  -- Response creativity (0.0-1.0)
   command_count = 5,  -- Number of commands to generate (default: 5)
+  max_results_history = 5,  -- Number of recent result sets to keep for recall (default: 5)
   history_file = wezterm.home_dir .. '/.wezterm_ai_prompt_history.txt',  -- History file location
   max_history = 100,  -- Maximum number of history items
 })
@@ -169,6 +157,7 @@ ai_plugin.apply_to_config(config, {
 - `provider`: Choose between "anthropic" (Claude) or "openai" (GPT)
 - `api_key`: Your API keys for the respective providers
 - `command_count`: Number of commands to generate (default: 5)
+- `max_results_history`: Number of recent result sets to keep for recall via Ctrl+Shift+X (default: 5)
 - `max_tokens`, `temperature`: Control AI response behavior
 - `history_file`, `max_history`: Manage prompt history storage
 
@@ -189,9 +178,9 @@ ai_plugin.apply_to_config(config, {
    - Check if there are any firewall restrictions
 
 3. **Keybindings not working**
-   - Ensure you've added the keybindings to your `config.keys` table as shown in the installation example
+   - Ensure `apply_to_config` is called before `return config` in your `.wezterm.lua`
    - Check for conflicts with other keybindings in your config
-   - Verify that `local act = wezterm.action` is defined in your config
+   - If you define `config.keys = { ... }` **after** `apply_to_config`, it will overwrite the plugin's keybindings; use `table.insert` instead, or define your keys before calling the plugin
 
 4. **Plugin not loading**
    - Ensure the plugin directory structure is correct

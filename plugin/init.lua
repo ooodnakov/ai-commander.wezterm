@@ -44,6 +44,11 @@ local default_config = {
 -- Active configuration (will be merged with user config)
 local config = default_config
 
+-- In-memory storage for last AI results (survives across calls, not across WezTerm restarts)
+-- Each entry: { prompt = "...", commands = { {cmd=..., desc=...}, ... } }
+local last_results = {}
+local max_results_history = 5
+
 -- Function to load prompt history from file
 local function load_prompt_history()
     local history = {}
@@ -294,7 +299,15 @@ local function process_prompt_with_context(prompt, context, window, pane)
         if #commands == 0 then
             pane:send_text("# Error: No commands generated")
             return
-        elseif #commands == 1 then
+        end
+
+        -- Save results for later recall via show_last_results
+        table.insert(last_results, 1, { prompt = prompt, commands = commands })
+        while #last_results > max_results_history do
+            table.remove(last_results)
+        end
+
+        if #commands == 1 then
             -- If only one command, send it without showing selector
             pane:send_text(commands[1].cmd)
             return
@@ -303,33 +316,9 @@ local function process_prompt_with_context(prompt, context, window, pane)
         -- Build choices with styled labels: command + inline description
         local choices = {}
         for idx, entry in ipairs(commands) do
-            -- For display in the single-line InputSelector, show first line of command + description
-            local first_line = entry.cmd:match("^([^\n]*)")
-            local is_multiline = entry.cmd:find("\n") ~= nil
-            local label
-
-            if entry.desc then
-                label = wezterm.format {
-                    { Foreground = { AnsiColor = 'Green' } },
-                    { Attribute = { Intensity = 'Bold' } },
-                    { Text = first_line .. (is_multiline and ' ...' or '') },
-                    'ResetAttributes',
-                    { Foreground = { AnsiColor = 'Fuchsia' } },
-                    { Text = '  \u{2502} ' },
-                    { Foreground = { AnsiColor = 'Silver' } },
-                    { Attribute = { Italic = true } },
-                    { Text = entry.desc },
-                }
-            else
-                label = wezterm.format {
-                    { Foreground = { AnsiColor = 'Green' } },
-                    { Attribute = { Intensity = 'Bold' } },
-                    { Text = first_line .. (is_multiline and ' ...' or '') },
-                }
-            end
             table.insert(choices, {
                 id = tostring(idx),
-                label = label,
+                label = build_command_label(entry),
             })
         end
 
@@ -361,9 +350,52 @@ function M.apply_to_config(wezterm_config, plugin_config)
     -- Merge user configuration with defaults
     if plugin_config then
         for key, value in pairs(plugin_config) do
-            config[key] = value
+            if key == 'max_results_history' then
+                max_results_history = value
+            else
+                config[key] = value
+            end
         end
     end
+
+    -- Register default keybindings
+    if not wezterm_config.keys then
+        wezterm_config.keys = {}
+    end
+
+    -- Alt+Shift+X: New AI prompt
+    table.insert(wezterm_config.keys, {
+        key = 'X',
+        mods = 'ALT|SHIFT',
+        action = wezterm.action_callback(function(window, pane)
+            M.show_prompt(window, pane)
+        end),
+    })
+
+    -- Ctrl+Shift+X: Show last AI results
+    table.insert(wezterm_config.keys, {
+        key = 'X',
+        mods = 'CTRL|SHIFT',
+        action = wezterm.action_callback(function(window, pane)
+            M.show_last_results(window, pane)
+        end),
+    })
+
+    -- Alt+Shift+H: Prompt history
+    table.insert(wezterm_config.keys, {
+        key = 'H',
+        mods = 'ALT|SHIFT',
+        action = wezterm.action_callback(function(window, pane)
+            M.show_history(window, pane)
+        end),
+    })
+
+    -- Alt+Backspace: Word deletion
+    table.insert(wezterm_config.keys, {
+        key = 'Backspace',
+        mods = 'ALT',
+        action = act.SendKey { key = 'w', mods = 'CTRL' },
+    })
 end
 
 -- Expose function for showing prompt history
@@ -399,6 +431,90 @@ function M.show_history(window, pane)
             title = 'Select Previous Prompt',
             choices = choices,
             description = 'Choose a prompt from history:',
+        },
+        pane
+    )
+end
+
+-- Helper to build a styled label for a command entry
+local function build_command_label(entry)
+    local first_line = entry.cmd:match("^([^\n]*)")
+    local is_multiline = entry.cmd:find("\n") ~= nil
+    local label
+
+    if entry.desc then
+        label = wezterm.format {
+            { Foreground = { AnsiColor = 'Green' } },
+            { Attribute = { Intensity = 'Bold' } },
+            { Text = first_line .. (is_multiline and ' ...' or '') },
+            'ResetAttributes',
+            { Foreground = { AnsiColor = 'Fuchsia' } },
+            { Text = '  \u{2502} ' },
+            { Foreground = { AnsiColor = 'Silver' } },
+            { Attribute = { Italic = true } },
+            { Text = entry.desc },
+        }
+    else
+        label = wezterm.format {
+            { Foreground = { AnsiColor = 'Green' } },
+            { Attribute = { Intensity = 'Bold' } },
+            { Text = first_line .. (is_multiline and ' ...' or '') },
+        }
+    end
+    return label
+end
+
+-- Expose function for showing last AI results
+function M.show_last_results(window, pane)
+    if #last_results == 0 then
+        -- No previous results, fall back to showing prompt
+        M.show_prompt(window, pane)
+        return
+    end
+
+    -- Build a flat list of choices grouped by prompt
+    local choices = {}
+    -- Flat lookup: map choice id -> { cmd, result_index }
+    local choice_map = {}
+    local choice_id = 0
+
+    for ri, result in ipairs(last_results) do
+        -- Add a header entry for the prompt
+        local header_label = wezterm.format {
+            { Foreground = { AnsiColor = 'Yellow' } },
+            { Attribute = { Intensity = 'Bold' } },
+            { Text = '\u{2500}\u{2500} ' .. result.prompt .. ' \u{2500}\u{2500}' },
+        }
+        table.insert(choices, {
+            id = '__header__',
+            label = header_label,
+        })
+
+        -- Add each command under this prompt
+        for ci, entry in ipairs(result.commands) do
+            choice_id = choice_id + 1
+            local id_str = tostring(choice_id)
+            choice_map[id_str] = { cmd = entry.cmd, result_index = ri }
+            table.insert(choices, {
+                id = id_str,
+                label = '  ' .. build_command_label(entry),
+            })
+        end
+    end
+
+    window:perform_action(
+        act.InputSelector {
+            action = wezterm.action_callback(function(window, pane, id, label)
+                if id and id ~= '__header__' then
+                    local mapping = choice_map[id]
+                    if mapping then
+                        pane:send_text(mapping.cmd)
+                    end
+                end
+            end),
+            title = 'Previous AI Results',
+            choices = choices,
+            description = 'Select a command from previous results (press / to filter):',
         },
         pane
     )
