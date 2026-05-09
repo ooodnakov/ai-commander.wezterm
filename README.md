@@ -58,7 +58,7 @@ config.keys = {
   { key = 'X', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_prompt(w, p) end) },
   { key = 'X', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_last_results(w, p) end) },
   { key = 'H', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_history(w, p) end) },
-  { key = 'a', mods = 'CTRL',       action = wezterm.action_callback(function(w, p) ai.show_ask_inline(w, p) end) },
+  { key = 'A', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_ask_inline(w, p) end) },
 }
 
 return config
@@ -71,7 +71,7 @@ return config
 | `show_prompt(w, p)`       | `Alt+Shift+X`       | Open prompt input, generate commands from text |
 | `show_last_results(w, p)` | `Ctrl+Shift+X`      | Recall previously generated commands           |
 | `show_history(w, p)`      | `Alt+Shift+H`       | Browse and re-run previous prompts             |
-| `show_ask_inline(w, p)`   | `Ctrl+A`            | Ask AI a question, stream response in split pane |
+| `show_ask_inline(w, p)`   | `Ctrl+Shift+A`      | Ask AI a question, stream response in split pane |
 
 ### Command Generation
 
@@ -82,14 +82,14 @@ return config
 
 ### Streaming Ask
 
-1. Press `Ctrl+A` → type a question
+1. Press `Ctrl+Shift+A` → type a question
 2. AI response streams in real-time in a split pane with markdown rendering via `sd` (streamdown)
 3. After streaming finishes, press any key to open the response in `less` for search, or `q` to close
 
 ### Context-Aware Generation
 
 1. **Select text** in the terminal (error message, file listing, log snippet, etc.)
-2. Press `Alt+Shift+X` (or `Ctrl+A`) → the selected text is sent as context alongside your prompt
+2. Press `Alt+Shift+X` (or `Ctrl+Shift+A`) → the selected text is sent as context alongside your prompt
 3. AI generates commands/answers that take the context into account
 
 ### Recalling Results
@@ -213,6 +213,29 @@ model = {
 
 That's it. The provider is auto-discovered and available via `provider = "myprovider"` in user config.
 
+## Updating the Plugin
+
+WezTerm [caches plugins locally](https://wezterm.org/config/plugins.html). After the plugin is updated upstream, you need to pull the new version:
+
+**Option 1** — from the WezTerm Debug Overlay (`Ctrl+Shift+L`):
+
+```lua
+wezterm.plugin.update_all()
+wezterm.reload_configuration()
+```
+
+**Option 2** — delete the cached copy and restart WezTerm:
+
+```bash
+# macOS
+rm -rf ~/Library/Application\ Support/wezterm/plugins/*ai-commander*
+
+# Linux
+rm -rf ~/.local/share/wezterm/plugins/*ai-commander*
+```
+
+WezTerm will re-fetch the plugin from the repository on next start.
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -221,6 +244,8 @@ That's it. The provider is auto-discovered and available via `provider = "myprov
 | *"Unsupported provider"* | Check that a matching file exists in `plugin/providers/` |
 | *"Failed to connect to API"* | Check internet, API key validity, firewall rules |
 | Keybindings not working | Ensure `config.keys` entries are present; check for conflicts |
+| Keybindings not working on macOS | Plain `CTRL+<key>` can conflict with terminal control characters or IME; use `CTRL+SHIFT` combos instead |
+| Plugin not updating | Clear the plugin cache (see [Updating the Plugin](#updating-the-plugin)) |
 | No commands generated | Rephrase the prompt to be more specific |
 | No syntax highlighting | Install [bat](https://github.com/sharkdp/bat) |
 | Streaming ask shows raw text | Install [streamdown](https://github.com/day50-dev/render-markdown-terminal): `uv tool install streamdown` |

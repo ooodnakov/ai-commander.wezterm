@@ -27,7 +27,7 @@ end
 -- Returns the string with ANSI escape codes, or the original string as fallback
 local function highlight_bash(text)
     local success, stdout, stderr = wezterm.run_child_process {
-        'bash', '-c', 'printf %s ' .. wezterm.shell_quote_arg(text) .. ' | bat --language=bash --color=always --style=plain --paging=never 2>/dev/null',
+        'bash', '-c', 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; printf %s ' .. wezterm.shell_quote_arg(text) .. ' | bat --language=bash --color=always --style=plain --paging=never 2>/dev/null',
     }
     if success and stdout and #stdout > 0 then
         -- Remove trailing newline that bat adds
