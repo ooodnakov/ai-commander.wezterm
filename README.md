@@ -154,7 +154,7 @@ ai.apply_to_config(config, {
 
 ## Adding a New Provider
 
-Providers live in `plugin/providers/` as individual Lua files that are auto-discovered at startup. To add a new provider:
+Providers live in `plugin/providers/` as individual Lua files. To add a new provider:
 
 1. Create `plugin/providers/<name>.lua` that returns a factory function:
 
@@ -200,7 +200,17 @@ return function(api_key, model, max_tokens, temperature)
 end
 ```
 
-2. Add default `api_url` and `model` entries in `plugin/config.lua`:
+2. Register it in `plugin/provider.lua`:
+
+```lua
+local providers = {
+    anthropic = require('providers.anthropic'),
+    openai = require('providers.openai'),
+    myprovider = require('providers.myprovider'),
+}
+```
+
+3. Add default `api_url` and `model` entries in `plugin/config.lua`:
 
 ```lua
 api_url = {
@@ -213,7 +223,7 @@ model = {
 },
 ```
 
-That's it. The provider is auto-discovered and available via `provider = "myprovider"` in user config.
+The provider is then available via `provider = "myprovider"` in user config.
 
 ## Updating the Plugin
 
