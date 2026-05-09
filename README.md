@@ -4,6 +4,8 @@ A WezTerm plugin that generates terminal commands and answers questions using AI
 
 ![Example Usage](./example.gif)
 
+![Ask Mode Example](./ask-mode-example.gif)
+
 ## Why
 
 When you need a command you don't remember or hit an error you need to troubleshoot, the typical flow is: open ChatGPT/Claude in a browser, paste the context, wait for the answer, copy the command back. Or launch a CLI agent like Claude Code, which takes over your terminal session -- overkill when you just need a quick one-liner or want to ask "what does this error mean?"
@@ -81,8 +83,6 @@ return config
 4. The command is inserted into your terminal
 
 ### Streaming Ask
-
-![Ask Mode Example](./ask-mode-example.gif)
 
 1. Press `Ctrl+Shift+A` → type a question
 2. AI response streams in real-time in a split pane with markdown rendering via `sd` (streamdown)
