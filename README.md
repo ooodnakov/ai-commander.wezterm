@@ -1,23 +1,37 @@
 # AI Commander for WezTerm
 
-A WezTerm plugin that generates terminal commands from natural language using AI providers (Anthropic Claude or OpenAI GPT).
+A WezTerm plugin that generates terminal commands and answers questions using AI providers (Anthropic Claude, OpenAI GPT, or custom).
 
 ![Example Usage](./example.gif)
+
+## Why
+
+When you need a command you don't remember or hit an error you need to troubleshoot, the typical flow is: open ChatGPT/Claude in a browser, paste the context, wait for the answer, copy the command back. Or launch a CLI agent like Claude Code, which takes over your terminal session -- overkill when you just need a quick one-liner or want to ask "what does this error mean?"
+
+AI Commander stays out of your way. Press a hotkey, type your question, get the answer -- all without leaving the terminal or interrupting your workflow:
+
+- **Quick command generation** — describe what you need, pick from ready-to-run variants, it's pasted into your shell. 
+- **Context-aware troubleshooting** — select an error message or log snippet in the terminal, press the hotkey, and get a fix specific to what just happened.
+- **Streaming ask** — ask any question and get a formatted, streamed response in a split pane. 
 
 ## Features
 
 - **Command Generation** — describe what you want in plain English, get ready-to-run commands
+- **Streaming Ask** — ask AI questions and get streamed, markdown-rendered responses in a split pane
 - **Multiple Options** — generates several command variants to choose from (default: 5)
 - **Context-Aware** — select text in the terminal (error messages, file paths, logs) and use it as context
 - **Results Recall** — browse and reuse previously generated commands without re-querying the API
 - **Prompt History** — access and re-run previous prompts from a persistent history file
 - **Syntax Highlighting** — commands are highlighted via `bat` (if installed) in the selection menu
+- **Pluggable Providers** — Anthropic and OpenAI built-in; add new providers by dropping a single file
 
 ## Prerequisites
 
 - **WezTerm** — recent version with Lua plugin support
 - **API Key** from [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/)
 - **bat** (optional) — for syntax highlighting in the command selector
+- **streamdown** (optional) — for streaming markdown rendering: `uv tool install streamdown`
+- **jq** — required for streaming ask mode
 
 ## Installation
 
@@ -44,6 +58,7 @@ config.keys = {
   { key = 'X', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_prompt(w, p) end) },
   { key = 'X', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_last_results(w, p) end) },
   { key = 'H', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_history(w, p) end) },
+  { key = 'a', mods = 'CTRL',       action = wezterm.action_callback(function(w, p) ai.show_ask_inline(w, p) end) },
 }
 
 return config
@@ -56,19 +71,26 @@ return config
 | `show_prompt(w, p)`       | `Alt+Shift+X`       | Open prompt input, generate commands from text |
 | `show_last_results(w, p)` | `Ctrl+Shift+X`      | Recall previously generated commands           |
 | `show_history(w, p)`      | `Alt+Shift+H`       | Browse and re-run previous prompts             |
+| `show_ask_inline(w, p)`   | `Ctrl+A`            | Ask AI a question, stream response in split pane |
 
-### Basic Workflow
+### Command Generation
 
 1. Press `Alt+Shift+X` → type what you need (e.g. *"find all PDF files modified today"*)
 2. AI generates several command options
 3. Pick one from the interactive selector (press `/` to filter)
 4. The command is inserted into your terminal
 
+### Streaming Ask
+
+1. Press `Ctrl+A` → type a question
+2. AI response streams in real-time in a split pane with markdown rendering via `sd` (streamdown)
+3. After streaming finishes, press any key to open the response in `less` for search, or `q` to close
+
 ### Context-Aware Generation
 
 1. **Select text** in the terminal (error message, file listing, log snippet, etc.)
-2. Press `Alt+Shift+X` → the selected text is sent as context alongside your prompt
-3. AI generates commands that take the context into account
+2. Press `Alt+Shift+X` (or `Ctrl+A`) → the selected text is sent as context alongside your prompt
+3. AI generates commands/answers that take the context into account
 
 ### Recalling Results
 
@@ -106,15 +128,21 @@ ai.apply_to_config(config, {
   },
 
   -- Generation parameters
-  max_tokens = 4000,
+  max_tokens = 4000,              -- max tokens for command generation
+  chat_max_tokens = 16000,        -- max tokens for streaming ask
   temperature = 0.1,
-  command_count = 5,            -- number of command variants to generate
+  command_count = 5,              -- number of command variants to generate
 
-  -- System prompt (defines AI persona and behavior)
-  system_prompt = "...",        -- see plugin/config.lua for the full default
+  -- Streaming ask renderer ('sd' for streamdown, 'cat' for plain text)
+  renderer = "sd",
+  chat_pane_size = 0.8,           -- split pane size (0.0-1.0)
+
+  -- System prompts (see plugin/config.lua for full defaults)
+  system_prompt = "...",          -- persona for command generation
+  chat_system_prompt = "...",     -- persona for streaming ask
 
   -- Results recall
-  max_results_history = 5,      -- how many result sets to keep in memory
+  max_results_history = 5,        -- how many result sets to keep in memory
 
   -- Prompt history (persisted to disk)
   history_file = wezterm.home_dir .. "/.wezterm_ai_prompt_history.txt",
@@ -122,15 +150,81 @@ ai.apply_to_config(config, {
 })
 ```
 
+## Adding a New Provider
+
+Providers live in `plugin/providers/` as individual Lua files that are auto-discovered at startup. To add a new provider:
+
+1. Create `plugin/providers/<name>.lua` that returns a factory function:
+
+```lua
+return function(api_key, model, max_tokens, temperature)
+    return {
+        -- HTTP headers for API requests
+        headers = {
+            { "Content-Type", "application/json" },
+            { "Authorization", "Bearer " .. api_key },
+        },
+
+        -- Build the JSON request body for blocking (non-streaming) calls
+        build_body = function(system_message, messages)
+            return {
+                model = model,
+                max_tokens = max_tokens,
+                temperature = temperature,
+                messages = messages,
+            }
+        end,
+
+        -- Extract the text content from a parsed JSON response
+        extract_response = function(response)
+            if response.choices and response.choices[1] then
+                return response.choices[1].message.content
+            end
+            return nil, "Error: No content in response"
+        end,
+
+        -- Bash pipeline to parse SSE stream into raw text (used for streaming ask)
+        stream_filter = table.concat({
+            "grep --line-buffered '^data: '",
+            "sed -u 's/^data: //'",
+            "jq --unbuffered -j '.choices[0].delta.content // empty'",
+        }, ' | '),
+
+        -- jq template for building the streaming request body
+        -- Available variables: $model, $max_tokens, $sys (system prompt), $msg (user message)
+        body_template = '\'{ model: $model, max_tokens: $max_tokens, stream: true,'
+            .. ' messages: [{ role: "system", content: $sys }, { role: "user", content: $msg }] }\'',
+    }
+end
+```
+
+2. Add default `api_url` and `model` entries in `plugin/config.lua`:
+
+```lua
+api_url = {
+    ...
+    myprovider = 'https://api.example.com/v1/chat/completions',
+},
+model = {
+    ...
+    myprovider = 'my-model-name',
+},
+```
+
+That's it. The provider is auto-discovered and available via `provider = "myprovider"` in user config.
+
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
 | *"API key not configured"* | Set `api_key.anthropic` or `api_key.openai` matching your `provider` |
+| *"Unsupported provider"* | Check that a matching file exists in `plugin/providers/` |
 | *"Failed to connect to API"* | Check internet, API key validity, firewall rules |
 | Keybindings not working | Ensure `config.keys` entries are present; check for conflicts |
 | No commands generated | Rephrase the prompt to be more specific |
 | No syntax highlighting | Install [bat](https://github.com/sharkdp/bat) |
+| Streaming ask shows raw text | Install [streamdown](https://github.com/day50-dev/render-markdown-terminal): `uv tool install streamdown` |
+| `sd` command not found | Ensure `~/.local/bin` is in your PATH, or set `renderer` to the full path |
 
 ## Security
 

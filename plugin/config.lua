@@ -18,10 +18,19 @@ local config = {
         openai = 'gpt-4o',
     },
     max_tokens = 4000,
+    chat_max_tokens = 16000,
+    renderer = 'sd', -- streaming markdown renderer command (streamdown); set to 'cat' for plain text
+    chat_pane_size = 0.8, -- fraction of pane given to the AI response (0.0-1.0)
     temperature = 0.1,
     command_count = 5, -- Number of commands to generate (default: 5)
     history_file = wezterm.home_dir .. '/.wezterm_ai_prompt_history.txt',
     max_history = 100,
+    chat_system_prompt = table.concat({
+        'You are a helpful assistant running inside a terminal.',
+        'Answer questions clearly and concisely using markdown formatting.',
+        'Use code blocks with language tags for any code or commands.',
+        'Keep explanations practical and actionable.',
+    }, '\n'),
     system_prompt = table.concat({
         'You are an expert DevOps/SRE engineer with deep hands-on experience in:',
         '- Linux/Unix system administration, shell scripting (bash/sh/zsh), and coreutils',
