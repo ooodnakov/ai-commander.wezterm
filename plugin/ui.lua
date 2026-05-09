@@ -6,6 +6,13 @@ local provider = require 'provider'
 
 local M = {}
 
+local function with_context(text, context)
+    if not context or context == '' then
+        return text
+    end
+    return text .. '\n\nContext:\n' .. context
+end
+
 -- In-memory storage for last AI results (survives across calls, not across WezTerm restarts)
 -- Each entry: { prompt = "...", commands = { {cmd=..., desc=...}, ... } }
 local last_results = {}
@@ -53,12 +60,12 @@ local function build_command_label(entry)
 end
 
 -- Process a prompt with optional context: call AI, parse response, show selector
-local function process_prompt_with_context(prompt, context, window, pane)
+local function process_prompt_with_context(user_prompt, context, window, pane)
     local config = cfg.get()
-    history.save(prompt)
+    history.save(user_prompt)
 
     local api_prompt = table.concat({
-        'Task: ' .. prompt,
+        'Task: ' .. user_prompt,
         '',
         'Generate ' .. config.command_count .. ' different command options to accomplish the task above.',
         '',
@@ -93,13 +100,9 @@ local function process_prompt_with_context(prompt, context, window, pane)
         '## Create a netshoot debugging pod via heredoc manifest',
     }, '\n')
 
-    -- Add context if available
-    if context and context ~= "" then
-        api_prompt = api_prompt .. '\n\nContext (text selected in terminal):\n' .. context
-    end
+    api_prompt = with_context(api_prompt, context)
 
     provider.call(config, config.system_prompt, api_prompt, function(response)
-
         -- Parse response into command + description pairs
         -- Description lines start with "## ". Everything between descriptions is the command
         -- (which may span multiple lines for heredocs, pipelines, etc.)
@@ -144,7 +147,7 @@ local function process_prompt_with_context(prompt, context, window, pane)
         end
 
         -- Save results for later recall via show_last_results
-        table.insert(last_results, 1, { prompt = prompt, commands = commands })
+        table.insert(last_results, 1, { prompt = user_prompt, commands = commands })
         while #last_results > max_results_history do
             table.remove(last_results)
         end
@@ -194,10 +197,10 @@ function M.show_history(window, pane)
 
     -- Create choices for history selection
     local choices = {}
-    for i, prompt in ipairs(hist) do
+    for i, hist_prompt in ipairs(hist) do
         table.insert(choices, {
             id = tostring(i),
-            label = prompt
+            label = hist_prompt
         })
     end
 
@@ -248,7 +251,7 @@ function M.show_last_results(window, pane)
         })
 
         -- Add each command under this prompt
-        for ci, entry in ipairs(result.commands) do
+        for _, entry in ipairs(result.commands) do
             choice_id = choice_id + 1
             local id_str = tostring(choice_id)
             choice_map[id_str] = { cmd = entry.cmd, result_index = ri }
@@ -281,13 +284,9 @@ end
 function M.show_prompt(window, pane)
     -- Get selected text as context
     local selection = window:get_selection_text_for_pane(pane)
-    local context_description = ""
-
-    if selection and selection ~= "" then
-        context_description = "Enter prompt for command to generate (selected text will be used as context):"
-    else
-        context_description = "Enter prompt for command to generate:"
-    end
+    local context_description = (selection and selection ~= "")
+        and "Enter prompt for command to generate (selected text will be used as context):"
+        or "Enter prompt for command to generate:"
 
     window:perform_action(
         act.PromptInputLine {
@@ -298,6 +297,81 @@ function M.show_prompt(window, pane)
                 end
 
                 process_prompt_with_context(line, selection, window, pane)
+            end),
+        },
+        pane
+    )
+end
+
+-- Build a bash script that streams an LLM response through a markdown renderer.
+--
+-- The provider layer (provider.build_stream_cmd) produces a `curl ... | sse-filter`
+-- fragment that emits raw model text on stdout, given $QUESTION in the env. This
+-- function wraps that fragment in the UI scaffolding: shebang, PATH, $QUESTION
+-- assignment (with optional context already merged in by prompt.with_context),
+-- renderer, tempfile capture, and post-stream pager prompt.
+local function build_streaming_script(config, question, context)
+    local renderer = config.renderer or 'sd'
+    local stream_cmd = provider.build_stream_cmd(config, config.chat_system_prompt,
+        { max_tokens = config.chat_max_tokens })
+    local full_question = with_context(question, context)
+
+    return table.concat({
+        '#!/bin/bash',
+        'set -euo pipefail',
+        'export PATH="$HOME/.local/bin:$PATH"',
+        'QUESTION=' .. wezterm.shell_quote_arg(full_question),
+        'RAW=$(mktemp /tmp/ai_response_XXXXXX)',
+        stream_cmd .. ' \\\n  | tee "$RAW" \\\n  | ' .. renderer,
+        '',
+        'echo',
+        'echo',
+        'read -n1 -r -p "Press q to quit, any other key to open in pager..."  key',
+        'if [ "$key" != "q" ]; then less -RS "$RAW"; fi',
+        'rm -f "$RAW"',
+    }, '\n')
+end
+
+-- Run a script in a zoomed split pane
+local function run_in_split(script, pane, window, config)
+    local scriptfile = os.tmpname() .. '_ask.sh'
+    local sf = io.open(scriptfile, 'w')
+    if sf then
+        sf:write(script)
+        sf:close()
+    end
+
+    local new_pane = pane:split {
+        direction = 'Bottom',
+        args = { 'bash', scriptfile },
+        size = config.chat_pane_size,
+    }
+    if new_pane then
+        window:perform_action(act.TogglePaneZoomState, new_pane)
+    end
+end
+
+-- Single-line prompt question, then stream AI response with markdown rendering
+function M.show_ask_inline(window, pane)
+    local selection = window:get_selection_text_for_pane(pane)
+    local desc = (selection and selection ~= "")
+        and "Ask AI (selected text as context):"
+        or "Ask AI:"
+
+    window:perform_action(
+        act.PromptInputLine {
+            description = desc,
+            action = wezterm.action_callback(function(window, pane, line)
+                if not line or line == "" then return end
+                local ok, err = pcall(function()
+                    local config = cfg.get()
+                    local script = build_streaming_script(config, line, selection)
+                    run_in_split(script, pane, window, config)
+                end)
+                if not ok then
+                    wezterm.log_error('ai-commander show_ask_inline: ' .. tostring(err))
+                    pane:send_text('# Error: ' .. tostring(err) .. '\n')
+                end
             end),
         },
         pane

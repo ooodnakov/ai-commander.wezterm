@@ -49,4 +49,10 @@ function M.show_last_results(window, pane)
     ui.show_last_results(window, pane)
 end
 
+-- Ask AI a quick question (single-line input, streamed response via sd)
+function M.show_ask_inline(window, pane)
+    ui.show_ask_inline(window, pane)
+end
+
+
 return M
