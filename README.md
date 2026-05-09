@@ -82,6 +82,8 @@ return config
 
 ### Streaming Ask
 
+![Ask Mode Example](./ask-mode-example.gif)
+
 1. Press `Ctrl+Shift+A` → type a question
 2. AI response streams in real-time in a split pane with markdown rendering via `sd` (streamdown)
 3. After streaming finishes, press any key to open the response in `less` for search, or `q` to close
