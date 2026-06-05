@@ -165,10 +165,10 @@ return function(auth, model, max_tokens, temperature)
             "grep -v '^\\[DONE\\]$'",
             "jq --unbuffered -j 'select(.type == \"response.output_text.delta\") | .delta // empty'",
         }, ' | '),
-        conversation_mode = 'previous_response_id',
-        body_template = '\'{ model: $model, instructions: $sys, input: [{ role: "user", content: $msg }],'
-            .. ' max_output_tokens: $max_tokens, temperature: $temperature, stream: true'
+        conversation_mode = 'messages',
+        body_template = '\'{ model: $model, instructions: $sys, input: ($history + [{ role: "user", content: $msg }]),'
+            .. ' max_output_tokens: $max_tokens, temperature: $temperature, stream: true, store: false'
             .. (reasoning_effort_for_model(model) and ', reasoning: { effort: "low" }' or '')
-            .. ' } + (if $previous_response_id == "" then {} else { previous_response_id: $previous_response_id } end)\'' ,
+            .. ' }\'',
     }
 end

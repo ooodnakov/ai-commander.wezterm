@@ -77,30 +77,106 @@ local function append_headers(curl_args, headers)
     end
 end
 
+local function is_codex_subscription_response(api_url, credential)
+    return credential
+        and credential.type == 'oauth'
+        and type(api_url) == 'string'
+        and api_url:find('chatgpt.com/backend-api/codex/responses', 1, true) ~= nil
+end
+
+local function prepare_codex_subscription_body(body)
+    body.stream = true
+    body.store = false
+
+    -- ChatGPT's Codex subscription endpoint is Responses-shaped, but stricter
+    -- than the public OpenAI Responses API. It rejects these public API fields.
+    body.max_output_tokens = nil
+    body.max_completion_tokens = nil
+    body.max_tokens = nil
+    body.temperature = nil
+    body.reasoning = nil
+
+    return body
+end
+
+
+local function extract_stream_response(stdout, details)
+    local parts = {}
+    local completed_response = nil
+    local failure = nil
+    local saw_event = false
+
+    for line in ((stdout or '') .. '\n'):gmatch("([^\r\n]*)\r?\n") do
+        local payload = line:match('^data:%s*(.*)$')
+        if payload and payload ~= '' and payload ~= '[DONE]' then
+            saw_event = true
+            local ok, event = pcall(wezterm.json_parse, payload)
+            if ok and type(event) == 'table' then
+                if event.type == 'response.output_text.delta' and type(event.delta) == 'string' then
+                    table.insert(parts, event.delta)
+                elseif event.type == 'response.output_text.done' and #parts == 0 and type(event.text) == 'string' then
+                    table.insert(parts, event.text)
+                elseif event.type == 'response.completed' and type(event.response) == 'table' then
+                    completed_response = event.response
+                elseif (event.type == 'response.failed' or event.type == 'error') and not failure then
+                    local err = event.error or (type(event.response) == 'table' and event.response.error)
+                    failure = 'API error: ' .. tostring(type(err) == 'table' and (err.message or err.code) or err or 'Unknown error')
+                end
+            end
+        end
+    end
+
+    if #parts > 0 then return table.concat(parts, ''), nil, true end
+    if completed_response then
+        local text, err = details.extract_response(completed_response)
+        return text, err, true
+    end
+    if failure then return nil, failure, true end
+    if saw_event then return nil, 'Error: Streaming response contained no assistant text', true end
+    return nil, nil, false
+end
+
 -- Blocking API call via wezterm.run_child_process (for command generation)
 function M.call(config, system_message, user_message, callback, opts)
-    local details, api_url = resolve(config, opts)
+    local details, api_url, credential = resolve(config, opts)
     if not details then
         callback(api_url)
         return
     end
 
+    local stream_response = is_codex_subscription_response(api_url, credential)
     local messages = {{ role = "user", content = user_message }}
     local body = details.build_body(system_message, messages)
+    if stream_response then
+        prepare_codex_subscription_body(body)
+    end
     local json_body = wezterm.json_encode(body)
 
     local curl_args = { 'curl', '-s', '--max-time', '120', '-X', 'POST' }
+    if stream_response then table.insert(curl_args, 3, '-N') end
     append_headers(curl_args, details.headers)
     table.insert(curl_args, api_url)
     table.insert(curl_args, '-d')
     table.insert(curl_args, json_body)
 
     local success, stdout, stderr = wezterm.run_child_process(curl_args)
+    stdout = stdout or ''
 
     if not success then
         wezterm.log_error('HTTP request failed: ' .. (stderr or 'Unknown error'))
         callback('Error: HTTP request failed. ' .. (stderr or 'Unknown error'))
         return
+    end
+
+    if stream_response then
+        local text, stream_err, saw_stream = extract_stream_response(stdout, details)
+        if text then
+            callback(text)
+            return
+        elseif saw_stream then
+            callback(stream_err or 'Error: Streaming response contained no assistant text')
+            return
+        end
     end
 
     local ok, response = pcall(wezterm.json_parse, stdout)
@@ -114,6 +190,11 @@ function M.call(config, system_message, user_message, callback, opts)
         return
     end
 
+    if response.detail then
+        callback('API error: ' .. tostring(response.detail))
+        return
+    end
+
     local text, extract_err = details.extract_response(response)
     if text then
         callback(text)
@@ -123,11 +204,11 @@ function M.call(config, system_message, user_message, callback, opts)
 end
 
 -- Build a bash streaming curl pipeline string.
--- Expects $QUESTION, $PREVIOUS_RESPONSE_ID, and $HISTORY_JSON to be set in the calling script.
+-- Expects $QUESTION and $HISTORY_JSON to be set in the calling script.
 -- Returns: curl ... | optional tee | sse_filter
 function M.build_stream_cmd(config, system_prompt, opts)
     opts = opts or {}
-    local details, api_url = resolve(config, opts)
+    local details, api_url, credential = resolve(config, opts)
     if not details then
         return 'echo ' .. wezterm.shell_quote_arg(api_url)
     end
@@ -137,15 +218,26 @@ function M.build_stream_cmd(config, system_prompt, opts)
         table.insert(header_lines, '  -H ' .. wezterm.shell_quote_arg(h[1] .. ': ' .. h[2]) .. ' \\')
     end
 
-    local jq_body = 'jq -n'
-        .. ' --arg sys ' .. wezterm.shell_quote_arg(system_prompt)
-        .. ' --arg msg "$QUESTION"'
-        .. ' --arg model ' .. wezterm.shell_quote_arg(details.model)
-        .. ' --arg previous_response_id "$PREVIOUS_RESPONSE_ID"'
-        .. ' --argjson history "$HISTORY_JSON"'
-        .. ' --argjson max_tokens ' .. tostring(details.max_tokens)
-        .. ' --argjson temperature ' .. tostring(config.temperature or 0.1)
-        .. ' ' .. details.body_template
+    local jq_body
+    if is_codex_subscription_response(api_url, credential) then
+        jq_body = 'jq -n'
+            .. ' --arg sys ' .. wezterm.shell_quote_arg(system_prompt)
+            .. ' --arg msg "$QUESTION"'
+            .. ' --arg model ' .. wezterm.shell_quote_arg(details.model)
+            .. ' --argjson history "$HISTORY_JSON"'
+            .. ' ' .. '\'{ model: $model, instructions: $sys,'
+            .. ' input: ($history + [{ role: "user", content: $msg }]),'
+            .. ' stream: true, store: false }\''
+    else
+        jq_body = 'jq -n'
+            .. ' --arg sys ' .. wezterm.shell_quote_arg(system_prompt)
+            .. ' --arg msg "$QUESTION"'
+            .. ' --arg model ' .. wezterm.shell_quote_arg(details.model)
+            .. ' --argjson history "$HISTORY_JSON"'
+            .. ' --argjson max_tokens ' .. tostring(details.max_tokens)
+            .. ' --argjson temperature ' .. tostring(config.temperature or 0.1)
+            .. ' ' .. details.body_template
+    end
 
     local capture = ''
     if opts.capture_events then
@@ -197,7 +289,7 @@ function M.check(config, validation_warnings)
         add('❌', 'jq is not available; streaming ask mode requires jq')
     end
 
-    local renderer = renderer_command(config.renderer or 'sd')
+    local renderer = renderer_command(config.renderer or 'streamdown')
     if renderer == 'cat' then
         add('✅', 'renderer is cat')
     elseif renderer and command_available(renderer) then

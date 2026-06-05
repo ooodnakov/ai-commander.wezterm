@@ -3,16 +3,44 @@
 
 local wezterm = require 'wezterm'
 
--- Find this plugin's directory and add it to package.path so submodules can be required
+local function configured_plugin_url()
+    local url = os.getenv('WEZTERM_AI_COMMANDER_PLUGIN_URL')
+    if url and url ~= '' then return url end
+    return 'https://github.com/ooodnakov/ai-commander.wezterm'
+end
+
 local plugin_dir
+local plugin_url = configured_plugin_url()
 for _, plugin in ipairs(wezterm.plugin.list()) do
-    if plugin.url:find('ai%-commander') then
+    if plugin.url == plugin_url then
         plugin_dir = plugin.plugin_dir
         break
     end
 end
+
+if not plugin_dir then
+    for _, plugin in ipairs(wezterm.plugin.list()) do
+        if plugin.url:find('ai%-commander') then
+            plugin_dir = plugin.plugin_dir
+            break
+        end
+    end
+end
+
 if plugin_dir then
-    package.path = plugin_dir .. '/plugin/?.lua;' .. package.path
+    package.path = plugin_dir .. '/plugin/?.lua;' .. plugin_dir .. '/plugin/?/init.lua;' .. package.path
+end
+
+for _, module in ipairs({
+    'config',
+    'ui',
+    'history',
+    'provider',
+    'auth',
+    'providers.openai',
+    'providers.anthropic',
+}) do
+    package.loaded[module] = nil
 end
 
 local cfg = require 'config'
@@ -49,7 +77,7 @@ function M.show_last_results(window, pane)
     ui.show_last_results(window, pane)
 end
 
--- Ask AI a quick question (single-line input, streamed response via sd)
+-- Open an interactive split-pane AI chat with streaming markdown rendering
 function M.show_ask_inline(window, pane)
     ui.show_ask_inline(window, pane)
 end

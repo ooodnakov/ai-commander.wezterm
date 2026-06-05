@@ -28,7 +28,7 @@ AI Commander stays out of your way. Press a hotkey, type your question, get the 
 - **Pluggable Providers** — Anthropic Messages and OpenAI Responses built in; add new providers by dropping a single file
 - **Subscription OAuth** — can reuse Claude Code and Codex CLI login credentials instead of manual API keys
 - **Provider Health Check** — validate credentials, endpoint reachability, `curl`, `jq`, renderer availability, and config warnings
-- **Conversation Continuity** — optionally continue ask-mode threads across prompts
+- **Conversation Continuity** — split-pane chat keeps message context; optionally persist it across panes
 
 ## Prerequisites
 
@@ -89,9 +89,10 @@ return config
 
 ### Streaming Ask
 
-1. Press `Ctrl+Shift+A` → type a question
-2. AI response streams in real-time in a split pane with markdown rendering via `sd` (streamdown)
-3. After streaming finishes, press any key to open the response in `less` for search, or `q` to close
+1. Press `Ctrl+Shift+A` to open an interactive bottom split
+2. Type questions at the `Ask AI>` prompt; responses stream with markdown rendering via `streamdown`
+3. Follow-up questions in the same chat pane include prior turns as context
+4. Type `/q`, `:q`, `q`, `quit`, or `exit` to close the chat pane
 
 ### Context-Aware Generation
 
@@ -165,14 +166,14 @@ ai.apply_to_config(config, {
   temperature = 0.1,
   command_count = 5,              -- number of command variants to generate
 
-  -- Streaming ask renderer ('sd' for streamdown, 'cat' for plain text)
-  renderer = "sd",
+  -- Streaming ask renderer ('streamdown' for rich markdown, 'cat' for plain text)
+  renderer = "streamdown",
   chat_pane_size = 0.8,           -- split pane size (0.0-1.0)
 
   -- Conversation continuity for ask mode
-  conversation_continuity = false, -- true to keep provider context between asks
+  conversation_continuity = false, -- true to persist chat context across split panes
   conversation_state_file = wezterm.home_dir .. "/.wezterm_ai_conversation_state.json",
-  max_conversation_messages = 12,  -- Claude manual history window
+  max_conversation_messages = 12,  -- in-pane and persisted history window
 
   -- System prompts (see plugin/config.lua for full defaults)
   system_prompt = "...",          -- persona for command generation
@@ -228,7 +229,7 @@ The helper returns the same report table it prints, so advanced configs can call
 
 ### Conversation Continuity
 
-Set `conversation_continuity = true` to make ask mode continue across prompts:
+`Ctrl+Shift+A` always keeps message context inside the opened chat pane, so follow-up questions can refer to prior answers. Set `conversation_continuity = true` only when you also want that chat context persisted across newly opened ask panes:
 
 ```lua
 ai.apply_to_config(config, {
@@ -237,7 +238,7 @@ ai.apply_to_config(config, {
 })
 ```
 
-For OpenAI Responses, the plugin stores the latest `response.id` and sends it as `previous_response_id` on the next ask. For Anthropic Messages, the plugin stores a compact local message history and prepends it to the next ask-mode request because Anthropic does not expose an equivalent `previous_response_id` parameter.
+The plugin stores a compact local message history for both OpenAI and Anthropic ask mode. This avoids unsupported subscription parameters such as `previous_response_id` and keeps the same behavior across providers.
 
 ### Config Validation
 
@@ -369,7 +370,7 @@ WezTerm will re-fetch the plugin from the repository on next start.
 | OpenAI says response is incomplete with no assistant text | Increase `max_tokens`/`chat_max_tokens`; GPT-5 reasoning tokens count against `max_output_tokens` |
 | No syntax highlighting | Install [bat](https://github.com/sharkdp/bat) |
 | Streaming ask shows raw text | Install [streamdown](https://github.com/day50-dev/render-markdown-terminal): `uv tool install streamdown` |
-| `sd` command not found | Ensure `~/.local/bin` is in your PATH, or set `renderer` to the full path |
+| `streamdown` command not found | Ensure `~/.local/bin` is in your PATH, or set `renderer` to the full path |
 
 ## Security
 

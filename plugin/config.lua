@@ -41,7 +41,7 @@ local config = {
     },
     max_tokens = 4000,
     chat_max_tokens = 16000,
-    renderer = 'sd', -- streaming markdown renderer command (streamdown); set to 'cat' for plain text
+    renderer = 'streamdown', -- streaming markdown renderer command; set to 'cat' for plain text
     chat_pane_size = 0.8, -- fraction of pane given to the AI response (0.0-1.0)
     conversation_continuity = false, -- keep ask-mode context across turns
     conversation_state_file = wezterm.home_dir .. '/.wezterm_ai_conversation_state.json',
@@ -149,7 +149,7 @@ function M.validate(current)
     end
 
     if not current.renderer or current.renderer == '' then
-        add_warning(warnings, 'renderer is empty; set it to "sd", "cat", or a command path.')
+        add_warning(warnings, 'renderer is empty; set it to "streamdown", "cat", or a command path.')
     end
 
     return warnings
