@@ -156,7 +156,7 @@ ai.apply_to_config(config, {
   -- Models
   model = {
     anthropic = "claude-haiku-4-5",
-    openai = "gpt-5.2",
+    openai = "gpt-5.5",
   },
 
   -- Generation parameters
@@ -212,7 +212,7 @@ For Codex/OpenAI, OAuth mode checks `CODEX_AUTH_TOKEN`, `OPENAI_AUTH_TOKEN`, `CH
 
 ### OpenAI API Shape
 
-OpenAI uses the Responses API (`https://api.openai.com/v1/responses`) for both blocking command generation and streaming ask mode. The OpenAI provider sends the system prompt as `instructions`, user text as `input`, output limits as `max_output_tokens`, and parses `response.output_text.delta` events while streaming.
+OpenAI uses the Responses API (`https://api.openai.com/v1/responses`) for both blocking command generation and streaming ask mode. The OpenAI provider sends the system prompt as `instructions`, user text as `input`, output limits as `max_output_tokens`, requests low reasoning effort for GPT-5/o-series models such as `gpt-5.5`, and parses `response.output_text.delta` events while streaming.
 
 
 ### Provider Health Check
@@ -366,6 +366,7 @@ WezTerm will re-fetch the plugin from the repository on next start.
 | Keybindings not working on macOS | Plain `CTRL+<key>` can conflict with terminal control characters or IME; use `CTRL+SHIFT` combos instead |
 | Plugin not updating | Clear the plugin cache (see [Updating the Plugin](#updating-the-plugin)) |
 | No commands generated | Rephrase the prompt to be more specific |
+| OpenAI says response is incomplete with no assistant text | Increase `max_tokens`/`chat_max_tokens`; GPT-5 reasoning tokens count against `max_output_tokens` |
 | No syntax highlighting | Install [bat](https://github.com/sharkdp/bat) |
 | Streaming ask shows raw text | Install [streamdown](https://github.com/day50-dev/render-markdown-terminal): `uv tool install streamdown` |
 | `sd` command not found | Ensure `~/.local/bin` is in your PATH, or set `renderer` to the full path |

@@ -37,7 +37,7 @@ local config = {
     },
     model = {
         anthropic = 'claude-haiku-4-5',
-        openai = 'gpt-5.2',
+        openai = 'gpt-5.5',
     },
     max_tokens = 4000,
     chat_max_tokens = 16000,
