@@ -312,9 +312,42 @@ end
 -- renderer, tempfile capture, and post-stream pager prompt.
 local function build_streaming_script(config, question, context)
     local renderer = config.renderer or 'sd'
+    local continuity_enabled = config.conversation_continuity and '1' or '0'
+    local state_file = config.conversation_state_file or (wezterm.home_dir .. '/.wezterm_ai_conversation_state.json')
+    local provider_name = config.provider or 'anthropic'
+    local max_messages = tostring(config.max_conversation_messages or 12)
     local stream_cmd = provider.build_stream_cmd(config, config.chat_system_prompt,
-        { max_tokens = config.chat_max_tokens })
+        { max_tokens = config.chat_max_tokens, capture_events = config.conversation_continuity })
     local full_question = with_context(question, context)
+
+    local continuity_prelude = table.concat({
+        'PROVIDER=' .. wezterm.shell_quote_arg(provider_name),
+        'CONTINUITY=' .. wezterm.shell_quote_arg(continuity_enabled),
+        'STATE_FILE=' .. wezterm.shell_quote_arg(state_file),
+        'MAX_CONVERSATION_MESSAGES=' .. wezterm.shell_quote_arg(max_messages),
+        'PREVIOUS_RESPONSE_ID=""',
+        'HISTORY_JSON="[]"',
+        'if [ "$CONTINUITY" = "1" ] && [ -f "$STATE_FILE" ]; then',
+        "  if jq -e --arg provider \"$PROVIDER\" '.provider == $provider' \"$STATE_FILE\" >/dev/null 2>&1; then",
+        "    PREVIOUS_RESPONSE_ID=$(jq -r '.previous_response_id // \"\"' \"$STATE_FILE\")",
+        "    HISTORY_JSON=$(jq -c '.messages // []' \"$STATE_FILE\")",
+        '  fi',
+        'fi',
+    }, '\n')
+
+    local continuity_epilogue = table.concat({
+        'if [ "$CONTINUITY" = "1" ]; then',
+        '  mkdir -p "$(dirname "$STATE_FILE")"',
+        '  if [ "$PROVIDER" = "openai" ]; then',
+        "    RESPONSE_ID=$(grep --line-buffered '^data: ' \"$EVENTS\" 2>/dev/null | sed 's/^data: //' | jq -r 'select(.type == \"response.created\" or .type == \"response.completed\") | .response.id // empty' | tail -n1 || true)",
+        '    if [ -n "$RESPONSE_ID" ]; then',
+        "      jq -n --arg provider \"$PROVIDER\" --arg id \"$RESPONSE_ID\" '{provider: $provider, previous_response_id: $id}' > \"$STATE_FILE.tmp\" && mv \"$STATE_FILE.tmp\" \"$STATE_FILE\"",
+        '    fi',
+        '  elif [ "$PROVIDER" = "anthropic" ]; then',
+        "    jq -n --arg provider \"$PROVIDER\" --arg user \"$QUESTION\" --rawfile assistant \"$RAW\" --argjson history \"$HISTORY_JSON\" --argjson max \"$MAX_CONVERSATION_MESSAGES\" '{provider: $provider, messages: (($history + [{role: \"user\", content: $user}, {role: \"assistant\", content: $assistant}]) | if length > $max then .[(length - $max):] else . end)}' > \"$STATE_FILE.tmp\" && mv \"$STATE_FILE.tmp\" \"$STATE_FILE\"",
+        '  fi',
+        'fi',
+    }, '\n')
 
     return table.concat({
         '#!/bin/bash',
@@ -322,13 +355,16 @@ local function build_streaming_script(config, question, context)
         'export PATH="$HOME/.local/bin:$PATH"',
         'QUESTION=' .. wezterm.shell_quote_arg(full_question),
         'RAW=$(mktemp /tmp/ai_response_XXXXXX)',
+        'EVENTS=$(mktemp /tmp/ai_events_XXXXXX)',
+        "trap 'rm -f \"$RAW\" \"$EVENTS\"' EXIT",
+        continuity_prelude,
         stream_cmd .. ' \\\n  | tee "$RAW" \\\n  | ' .. renderer,
+        continuity_epilogue,
         '',
         'echo',
         'echo',
         'read -n1 -r -p "Press q to quit, any other key to open in pager..."  key',
         'if [ "$key" != "q" ]; then less -RS "$RAW"; fi',
-        'rm -f "$RAW"',
     }, '\n')
 end
 
@@ -376,6 +412,18 @@ function M.show_ask_inline(window, pane)
         },
         pane
     )
+end
+
+
+-- Run provider diagnostics and print the report into the current pane
+function M.check_provider(window, pane)
+    local config = cfg.get()
+    local warnings = cfg.validate(config)
+    local report = provider.check(config, warnings)
+    if pane then
+        pane:send_text('\n# AI Commander Provider Check\n' .. report.message .. '\n')
+    end
+    return report
 end
 
 return M

@@ -54,5 +54,10 @@ function M.show_ask_inline(window, pane)
     ui.show_ask_inline(window, pane)
 end
 
+-- Validate provider configuration and local dependencies
+function M.check_provider(window, pane)
+    return ui.check_provider(window, pane)
+end
+
 
 return M

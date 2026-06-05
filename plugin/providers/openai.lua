@@ -1,37 +1,76 @@
-return function(api_key, model, max_tokens, temperature)
+local function as_text(content)
+    if type(content) == 'string' then return content end
+    if type(content) == 'table' then
+        local parts = {}
+        for _, part in ipairs(content) do
+            if type(part) == 'string' then
+                table.insert(parts, part)
+            elseif type(part) == 'table' and part.text then
+                table.insert(parts, part.text)
+            end
+        end
+        if #parts > 0 then return table.concat(parts, '') end
+    end
+    return nil
+end
+
+local function extract_responses_text(response)
+    if type(response) ~= 'table' then return nil end
+    if response.output_text then return response.output_text end
+
+    if response.output then
+        local parts = {}
+        for _, item in ipairs(response.output) do
+            if item.content then
+                for _, content in ipairs(item.content) do
+                    local text = content.text or content.output_text
+                    if text then table.insert(parts, text) end
+                end
+            end
+        end
+        if #parts > 0 then return table.concat(parts, '') end
+    end
+
+    return nil
+end
+
+return function(auth, model, max_tokens, temperature)
+    local headers = {
+        { 'Content-Type', 'application/json' },
+    }
+    for _, h in ipairs(auth.headers) do table.insert(headers, h) end
+
     return {
         model = model,
         max_tokens = max_tokens,
-        headers = {
-            { "Content-Type", "application/json" },
-            { "Authorization", "Bearer " .. api_key },
-        },
+        headers = headers,
         build_body = function(system_message, messages)
-            local oai_messages = {{ role = "system", content = system_message }}
+            local input = {}
             for _, m in ipairs(messages) do
-                table.insert(oai_messages, m)
+                table.insert(input, { role = m.role, content = as_text(m.content) or m.content })
             end
             return {
                 model = model,
-                max_tokens = max_tokens,
+                instructions = system_message,
+                input = input,
+                max_output_tokens = max_tokens,
                 temperature = temperature,
-                messages = oai_messages,
             }
         end,
         extract_response = function(response)
-            if response.choices and #response.choices > 0
-                and response.choices[1].message and response.choices[1].message.content then
-                return response.choices[1].message.content
-            end
-            return nil, "Error: No content found in OpenAI API response"
+            local text = extract_responses_text(response)
+            if text then return text end
+            return nil, 'Error: No content found in OpenAI Responses API response'
         end,
         stream_filter = table.concat({
             "grep --line-buffered '^data: '",
             "sed -u 's/^data: //'",
             "grep -v '^\\[DONE\\]$'",
-            "jq --unbuffered -j '.choices[0].delta.content // empty'",
+            "jq --unbuffered -j 'select(.type == \"response.output_text.delta\") | .delta // empty'",
         }, ' | '),
-        body_template = '\'{ model: $model, max_tokens: $max_tokens, temperature: 0.1, stream: true,'
-            .. ' messages: [{ role: "system", content: $sys }, { role: "user", content: $msg }] }\'',
+        conversation_mode = 'previous_response_id',
+        body_template = '\'{ model: $model, instructions: $sys, input: [{ role: "user", content: $msg }],'
+            .. ' max_output_tokens: $max_tokens, temperature: $temperature, stream: true }'
+            .. ' + (if $previous_response_id == "" then {} else { previous_response_id: $previous_response_id } end)\'' ,
     }
 end
