@@ -32,8 +32,10 @@ local providers = {
 }
 
 local function command_available(command)
-    local success = wezterm.run_child_process({ 'sh', '-lc', 'command -v ' .. wezterm.shell_quote_arg(command) .. ' >/dev/null 2>&1' })
-    return success
+    local ok, success = pcall(wezterm.run_child_process, {
+        'sh', '-lc', 'command -v ' .. wezterm.shell_quote_arg(command) .. ' >/dev/null 2>&1'
+    })
+    return ok and success
 end
 
 local function renderer_command(renderer)
@@ -205,11 +207,11 @@ function M.check(config, validation_warnings)
     end
 
     if details and api_url and command_available('curl') then
-        local success, stdout = wezterm.run_child_process({
+        local ok, success, stdout = pcall(wezterm.run_child_process, {
             'curl', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
             '--connect-timeout', '5', '--max-time', '10', api_url,
         })
-        if success then
+        if ok and success then
             local code = tonumber(stdout)
             if code and code >= 200 and code < 500 then
                 add('✅', 'endpoint is reachable (HTTP ' .. tostring(code) .. ')')

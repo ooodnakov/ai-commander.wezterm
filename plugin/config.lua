@@ -136,9 +136,11 @@ function M.validate(current)
         end
     end
 
-    if tonumber(current.chat_max_tokens or 0) <= 0 then
+    local chat_max = tonumber(current.chat_max_tokens) or 0
+    local max_tok = tonumber(current.max_tokens) or 0
+    if chat_max <= 0 then
         add_warning(warnings, 'chat_max_tokens should be greater than zero.')
-    elseif tonumber(current.max_tokens or 0) > tonumber(current.chat_max_tokens or 0) then
+    elseif max_tok > chat_max then
         add_warning(warnings, 'max_tokens is greater than chat_max_tokens; ask mode may allow fewer tokens than command generation.')
     end
 

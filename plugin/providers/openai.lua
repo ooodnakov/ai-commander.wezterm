@@ -15,6 +15,7 @@ local function as_text(content)
 end
 
 local function extract_responses_text(response)
+    if type(response) ~= 'table' then return nil end
     if response.output_text then return response.output_text end
 
     if response.output then

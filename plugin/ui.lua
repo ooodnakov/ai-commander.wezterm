@@ -339,7 +339,7 @@ local function build_streaming_script(config, question, context)
         'if [ "$CONTINUITY" = "1" ]; then',
         '  mkdir -p "$(dirname "$STATE_FILE")"',
         '  if [ "$PROVIDER" = "openai" ]; then',
-        "    RESPONSE_ID=$(grep --line-buffered '^data: ' \"$EVENTS\" 2>/dev/null | sed 's/^data: //' | jq -r 'select(.type == \"response.created\" or .type == \"response.completed\") | .response.id // empty' | tail -n1)",
+        "    RESPONSE_ID=$(grep --line-buffered '^data: ' \"$EVENTS\" 2>/dev/null | sed 's/^data: //' | jq -r 'select(.type == \"response.created\" or .type == \"response.completed\") | .response.id // empty' | tail -n1 || true)",
         '    if [ -n "$RESPONSE_ID" ]; then',
         "      jq -n --arg provider \"$PROVIDER\" --arg id \"$RESPONSE_ID\" '{provider: $provider, previous_response_id: $id}' > \"$STATE_FILE.tmp\" && mv \"$STATE_FILE.tmp\" \"$STATE_FILE\"",
         '    fi',
@@ -356,6 +356,7 @@ local function build_streaming_script(config, question, context)
         'QUESTION=' .. wezterm.shell_quote_arg(full_question),
         'RAW=$(mktemp /tmp/ai_response_XXXXXX)',
         'EVENTS=$(mktemp /tmp/ai_events_XXXXXX)',
+        "trap 'rm -f \"$RAW\" \"$EVENTS\"' EXIT",
         continuity_prelude,
         stream_cmd .. ' \\\n  | tee "$RAW" \\\n  | ' .. renderer,
         continuity_epilogue,
@@ -364,7 +365,6 @@ local function build_streaming_script(config, question, context)
         'echo',
         'read -n1 -r -p "Press q to quit, any other key to open in pager..."  key',
         'if [ "$key" != "q" ]; then less -RS "$RAW"; fi',
-        'rm -f "$RAW" "$EVENTS"',
     }, '\n')
 end
 

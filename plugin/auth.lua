@@ -4,7 +4,9 @@ local M = {}
 
 local function expand_path(path)
     if not path or path == '' then return nil end
-    path = path:gsub('^~', wezterm.home_dir)
+    if path:sub(1, 1) == '~' then
+        path = wezterm.home_dir .. path:sub(2)
+    end
     path = path:gsub('%$([A-Z_][A-Z0-9_]*)', function(name)
         return os.getenv(name) or ''
     end)

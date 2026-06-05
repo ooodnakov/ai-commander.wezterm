@@ -32,7 +32,7 @@ return function(auth, model, max_tokens, temperature)
             }
         end,
         extract_response = function(response)
-            if response.content and #response.content > 0 then
+            if type(response) == 'table' and response.content and #response.content > 0 then
                 local parts = {}
                 for _, block in ipairs(response.content) do
                     if block.text then table.insert(parts, block.text) end
