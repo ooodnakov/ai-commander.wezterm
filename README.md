@@ -25,12 +25,15 @@ AI Commander stays out of your way. Press a hotkey, type your question, get the 
 - **Results Recall** — browse and reuse previously generated commands without re-querying the API
 - **Prompt History** — access and re-run previous prompts from a persistent history file
 - **Syntax Highlighting** — commands are highlighted via `bat` (if installed) in the selection menu
-- **Pluggable Providers** — Anthropic and OpenAI built-in; add new providers by dropping a single file
+- **Pluggable Providers** — Anthropic Messages and OpenAI Responses built in; add new providers by dropping a single file
+- **Subscription OAuth** — can reuse Claude Code and Codex CLI login credentials instead of manual API keys
+- **Provider Health Check** — validate credentials, endpoint reachability, `curl`, `jq`, renderer availability, and config warnings
+- **Conversation Continuity** — optionally continue ask-mode threads across prompts
 
 ## Prerequisites
 
 - **WezTerm** — recent version with Lua plugin support
-- **API Key** from [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/)
+- **API key** from [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/), or local OAuth/subscription credentials from Claude Code/Codex CLI
 - **bat** (optional) — for syntax highlighting in the command selector
 - **streamdown** (optional) — for streaming markdown rendering: `uv tool install streamdown`
 - **jq** — required for streaming ask mode
@@ -61,6 +64,7 @@ config.keys = {
   { key = 'X', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_last_results(w, p) end) },
   { key = 'H', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_history(w, p) end) },
   { key = 'A', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_ask_inline(w, p) end) },
+  { key = 'P', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.check_provider(w, p) end) },
 }
 
 return config
@@ -74,6 +78,7 @@ return config
 | `show_last_results(w, p)` | `Ctrl+Shift+X`      | Recall previously generated commands           |
 | `show_history(w, p)`      | `Alt+Shift+H`       | Browse and re-run previous prompts             |
 | `show_ask_inline(w, p)`   | `Ctrl+Shift+A`      | Ask AI a question, stream response in split pane |
+| `check_provider(w, p)`     | `Ctrl+Shift+P`      | Validate credentials, endpoint, dependencies, and config |
 
 ### Command Generation
 
@@ -111,7 +116,13 @@ ai.apply_to_config(config, {
   -- Provider: "anthropic" or "openai"
   provider = "anthropic",
 
-  -- API keys (only the active provider's key is required)
+  -- Authentication per provider: "api_key" (default), "oauth"/"subscription", or "auto"
+  auth_type = {
+    anthropic = "api_key",
+    openai = "api_key",
+  },
+
+  -- API keys (only the active provider's key is required in api_key mode)
   api_key = {
     anthropic = nil,
     openai = nil,
@@ -120,13 +131,32 @@ ai.apply_to_config(config, {
   -- API endpoints (override for proxies or compatible APIs)
   api_url = {
     anthropic = "https://api.anthropic.com/v1/messages",
-    openai = "https://api.openai.com/v1/chat/completions",
+    openai = "https://api.openai.com/v1/responses",
+  },
+
+  -- OAuth/subscription endpoints used in oauth/subscription mode
+  subscription_api_url = {
+    anthropic = "https://api.anthropic.com/v1/messages",
+    openai = "https://chatgpt.com/backend-api/codex/responses",
+  },
+
+  -- Optional OAuth token overrides; defaults read common CLI credential files
+  oauth = {
+    anthropic = {
+      access_token = nil,
+      credentials_path = nil, -- $CLAUDE_CONFIG_DIR/.credentials.json or ~/.claude/.credentials.json
+    },
+    openai = {
+      access_token = nil,
+      account_id = nil,
+      credentials_path = nil, -- $CODEX_HOME/auth.json or ~/.codex/auth.json
+    },
   },
 
   -- Models
   model = {
     anthropic = "claude-haiku-4-5",
-    openai = "gpt-4o",
+    openai = "gpt-5.2",
   },
 
   -- Generation parameters
@@ -138,6 +168,11 @@ ai.apply_to_config(config, {
   -- Streaming ask renderer ('sd' for streamdown, 'cat' for plain text)
   renderer = "sd",
   chat_pane_size = 0.8,           -- split pane size (0.0-1.0)
+
+  -- Conversation continuity for ask mode
+  conversation_continuity = false, -- true to keep provider context between asks
+  conversation_state_file = wezterm.home_dir .. "/.wezterm_ai_conversation_state.json",
+  max_conversation_messages = 12,  -- Claude manual history window
 
   -- System prompts (see plugin/config.lua for full defaults)
   system_prompt = "...",          -- persona for command generation
@@ -152,6 +187,62 @@ ai.apply_to_config(config, {
 })
 ```
 
+
+### OAuth / Subscription Credentials
+
+AI Commander can use existing CLI subscription logins when you choose OAuth mode:
+
+```lua
+ai.apply_to_config(config, {
+  provider = "anthropic",
+  auth_type = { anthropic = "oauth" },
+})
+```
+
+For Claude, OAuth mode checks `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_AUTH_TOKEN`, then `$CLAUDE_CONFIG_DIR/.credentials.json` or `~/.claude/.credentials.json`. Claude Code can create a long-lived subscription token with `claude setup-token`.
+
+```lua
+ai.apply_to_config(config, {
+  provider = "openai",
+  auth_type = { openai = "oauth" },
+})
+```
+
+For Codex/OpenAI, OAuth mode checks `CODEX_AUTH_TOKEN`, `OPENAI_AUTH_TOKEN`, `CHATGPT_AUTH_TOKEN`, then `$CODEX_HOME/auth.json` or `~/.codex/auth.json`. In OAuth mode the default OpenAI endpoint switches to the Codex subscription Responses endpoint. If you want regular OpenAI API billing, leave `auth_type.openai = "api_key"`.
+
+### OpenAI API Shape
+
+OpenAI uses the Responses API (`https://api.openai.com/v1/responses`) for both blocking command generation and streaming ask mode. The OpenAI provider sends the system prompt as `instructions`, user text as `input`, output limits as `max_output_tokens`, and parses `response.output_text.delta` events while streaming.
+
+
+### Provider Health Check
+
+Run `ai.check_provider(w, p)` from a keybinding to print diagnostics into the current pane. It checks:
+
+- active provider and config validation warnings
+- credential resolution for the selected auth mode
+- `curl`, `jq`, and renderer command availability
+- endpoint reachability with a short, non-generating `curl` request
+
+The helper returns the same report table it prints, so advanced configs can call it programmatically.
+
+### Conversation Continuity
+
+Set `conversation_continuity = true` to make ask mode continue across prompts:
+
+```lua
+ai.apply_to_config(config, {
+  conversation_continuity = true,
+  conversation_state_file = wezterm.home_dir .. "/.wezterm_ai_conversation_state.json",
+})
+```
+
+For OpenAI Responses, the plugin stores the latest `response.id` and sends it as `previous_response_id` on the next ask. For Anthropic Messages, the plugin stores a compact local message history and prepends it to the next ask-mode request because Anthropic does not expose an equivalent `previous_response_id` parameter.
+
+### Config Validation
+
+`ai.apply_to_config` logs warnings with `wezterm.log_warn` when the active provider has suspicious settings, such as a missing model, a non-Responses OpenAI endpoint, invalid auth mode, ignored API keys in OAuth mode, invalid token limits, or missing conversation state path. `ai.check_provider(w, p)` includes the same warnings in its report.
+
 ## Adding a New Provider
 
 Providers live in `plugin/providers/` as individual Lua files. To add a new provider:
@@ -159,13 +250,20 @@ Providers live in `plugin/providers/` as individual Lua files. To add a new prov
 1. Create `plugin/providers/<name>.lua` that returns a factory function:
 
 ```lua
-return function(api_key, model, max_tokens, temperature)
+return function(auth, model, max_tokens, temperature)
+    local headers = {
+        { "Content-Type", "application/json" },
+    }
+    -- Preserve whichever credential headers auth.resolve selected.
+    -- For OpenAI this may be Authorization: Bearer <API key or OAuth token>;
+    -- for Anthropic it may be x-api-key or Authorization: Bearer <OAuth token>.
+    for _, h in ipairs(auth.headers) do
+        table.insert(headers, h)
+    end
+
     return {
         -- HTTP headers for API requests
-        headers = {
-            { "Content-Type", "application/json" },
-            { "Authorization", "Bearer " .. api_key },
-        },
+        headers = headers,
 
         -- Build the JSON request body for blocking (non-streaming) calls
         build_body = function(system_message, messages)
@@ -215,7 +313,7 @@ local providers = {
 ```lua
 api_url = {
     ...
-    myprovider = 'https://api.example.com/v1/chat/completions',
+    myprovider = 'https://api.example.com/v1/responses',
 },
 model = {
     ...
@@ -224,6 +322,15 @@ model = {
 ```
 
 The provider is then available via `provider = "myprovider"` in user config.
+
+
+## Suggested Improvements
+
+These are good follow-up improvements for the plugin once OAuth and Responses support are stable:
+
+- **Credential refresh** — refresh expired Claude/Codex OAuth tokens automatically when the local CLI credential file includes refresh metadata.
+- **Structured command responses** — ask providers for JSON command/description output instead of parsing free-form `##` description lines.
+- **Conversation reset UI** — add a helper to clear or switch ask-mode conversation state without deleting the state file manually.
 
 ## Updating the Plugin
 
@@ -252,7 +359,7 @@ WezTerm will re-fetch the plugin from the repository on next start.
 
 | Problem | Solution |
 |---------|----------|
-| *"API key not configured"* | Set `api_key.anthropic` or `api_key.openai` matching your `provider` |
+| *"credentials not configured"* | Set `api_key.<provider>` for API-key mode or `auth_type.<provider> = "oauth"` with Claude Code/Codex credentials |
 | *"Unsupported provider"* | Check that a matching file exists in `plugin/providers/` |
 | *"Failed to connect to API"* | Check internet, API key validity, firewall rules |
 | Keybindings not working | Ensure `config.keys` entries are present; check for conflicts |
