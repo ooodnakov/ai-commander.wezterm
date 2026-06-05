@@ -25,18 +25,23 @@ AI Commander stays out of your way. Press a hotkey, type your question, get the 
 - **Results Recall** — browse and reuse previously generated commands without re-querying the API
 - **Prompt History** — access and re-run previous prompts from a persistent history file
 - **Syntax Highlighting** — commands are highlighted via `bat` (if installed) in the selection menu
-- **Pluggable Providers** — Anthropic Messages and OpenAI Responses built in; add new providers by dropping a single file
+- **Pluggable Providers** — Anthropic Messages and OpenAI Responses built in; provider support lives in the Python backend plus Lua diagnostics
 - **Subscription OAuth** — can reuse Claude Code and Codex CLI login credentials instead of manual API keys
-- **Provider Health Check** — validate credentials, endpoint reachability, `curl`, `jq`, renderer availability, and config warnings
+- **Provider Health Check** — validate credentials, Python backend, renderer availability, and config warnings
 - **Conversation Continuity** — split-pane chat keeps message context; optionally persist it across panes
 
 ## Prerequisites
 
 - **WezTerm** — recent version with Lua plugin support
+- **Python 3 backend venv** — provider calls and Rich markdown rendering:
+  ```sh
+  python -m venv ~/.local/share/ai-commander.wezterm/venv
+  ~/.local/share/ai-commander.wezterm/venv/bin/python -m pip install -r requirements.txt
+  ```
 - **API key** from [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/), or local OAuth/subscription credentials from Claude Code/Codex CLI
 - **bat** (optional) — for syntax highlighting in the command selector
-- **streamdown** (optional) — for streaming markdown rendering: `uv tool install streamdown`
-- **jq** — required for streaming ask mode
+
+`backend_python = nil` auto-detects this venv before falling back to `python`/`python3`. You can also set `WEZTERM_AI_COMMANDER_BACKEND_PYTHON` or `backend_python` explicitly.
 
 ## Installation
 
@@ -83,16 +88,18 @@ return config
 ### Command Generation
 
 1. Press `Alt+Shift+X` → type what you need (e.g. *"find all PDF files modified today"*)
-2. AI generates several command options
-3. Pick one from the interactive selector (press `/` to filter)
+2. AI Commander keeps a branded “Generating Commands” selector open while the backend works
+3. Pick one of the styled command options from the selector (press `/` to filter; `↵` marks multiline commands)
 4. The command is inserted into your terminal
 
 ### Streaming Ask
 
 1. Press `Ctrl+Shift+A` to open an interactive bottom split
-2. Type questions at the `Ask AI>` prompt; responses stream with markdown rendering via `streamdown`
+2. Type questions at the `Ask AI>` prompt; responses render incrementally with Python Rich markdown
 3. Follow-up questions in the same chat pane include prior turns as context
 4. Type `/q`, `:q`, `q`, `quit`, or `exit` to close the chat pane
+
+Rich uses `rich.live.Live(Panel(Markdown(buffer)), refresh_per_second=12, screen=false)` to update a bordered AI response panel in place while tokens arrive, avoiding Glow-style scrollback rewrite hacks. Set `renderer = "streamdown"` for an external streaming renderer, or `renderer = "cat"` for plain text.
 
 ### Context-Aware Generation
 
@@ -166,8 +173,14 @@ ai.apply_to_config(config, {
   temperature = 0.1,
   command_count = 5,              -- number of command variants to generate
 
-  -- Streaming ask renderer ('streamdown' for rich markdown, 'cat' for plain text)
-  renderer = "streamdown",
+  -- Python backend executable; nil auto-detects:
+  -- $WEZTERM_AI_COMMANDER_BACKEND_PYTHON,
+  -- ~/.local/share/ai-commander.wezterm/venv/bin/python,
+  -- then python/python3.
+  backend_python = nil,
+
+  -- Streaming ask renderer ('rich', 'streamdown', 'cat', or command path)
+  renderer = "rich",
   chat_pane_size = 0.8,           -- split pane size (0.0-1.0)
 
   -- Conversation continuity for ask mode
@@ -222,8 +235,8 @@ Run `ai.check_provider(w, p)` from a keybinding to print diagnostics into the cu
 
 - active provider and config validation warnings
 - credential resolution for the selected auth mode
-- `curl`, `jq`, and renderer command availability
-- endpoint reachability with a short, non-generating `curl` request
+- Python backend, `requests`, and Rich availability
+- renderer availability when configured; raw markdown fallback otherwise
 
 The helper returns the same report table it prints, so advanced configs can call it programmatically.
 
@@ -246,83 +259,16 @@ The plugin stores a compact local message history for both OpenAI and Anthropic 
 
 ## Adding a New Provider
 
-Providers live in `plugin/providers/` as individual Lua files. To add a new provider:
+Provider requests are executed by `plugin/backend.py`. Lua provider modules under `plugin/providers/` are still used for config/auth diagnostics, but a new provider also needs backend support.
 
-1. Create `plugin/providers/<name>.lua` that returns a factory function:
+To add a provider:
 
-```lua
-return function(auth, model, max_tokens, temperature)
-    local headers = {
-        { "Content-Type", "application/json" },
-    }
-    -- Preserve whichever credential headers auth.resolve selected.
-    -- For OpenAI this may be Authorization: Bearer <API key or OAuth token>;
-    -- for Anthropic it may be x-api-key or Authorization: Bearer <OAuth token>.
-    for _, h in ipairs(auth.headers) do
-        table.insert(headers, h)
-    end
+1. Add default `api_url`, `subscription_api_url` if needed, and `model` entries in `plugin/config.lua`.
+2. Add auth lookup rules in `plugin/auth.lua` and matching credential resolution in `plugin/backend.py`.
+3. Register Lua diagnostic metadata in `plugin/provider.lua` / `plugin/providers/<name>.lua`.
+4. Implement request-body construction, response extraction, and SSE delta parsing in `plugin/backend.py`.
 
-    return {
-        -- HTTP headers for API requests
-        headers = headers,
-
-        -- Build the JSON request body for blocking (non-streaming) calls
-        build_body = function(system_message, messages)
-            return {
-                model = model,
-                max_tokens = max_tokens,
-                temperature = temperature,
-                messages = messages,
-            }
-        end,
-
-        -- Extract the text content from a parsed JSON response
-        extract_response = function(response)
-            if response.choices and response.choices[1] then
-                return response.choices[1].message.content
-            end
-            return nil, "Error: No content in response"
-        end,
-
-        -- Bash pipeline to parse SSE stream into raw text (used for streaming ask)
-        stream_filter = table.concat({
-            "grep --line-buffered '^data: '",
-            "sed -u 's/^data: //'",
-            "jq --unbuffered -j '.choices[0].delta.content // empty'",
-        }, ' | '),
-
-        -- jq template for building the streaming request body
-        -- Available variables: $model, $max_tokens, $sys (system prompt), $msg (user message)
-        body_template = '\'{ model: $model, max_tokens: $max_tokens, stream: true,'
-            .. ' messages: [{ role: "system", content: $sys }, { role: "user", content: $msg }] }\'',
-    }
-end
-```
-
-2. Register it in `plugin/provider.lua`:
-
-```lua
-local providers = {
-    anthropic = require('providers.anthropic'),
-    openai = require('providers.openai'),
-    myprovider = require('providers.myprovider'),
-}
-```
-
-3. Add default `api_url` and `model` entries in `plugin/config.lua`:
-
-```lua
-api_url = {
-    ...
-    myprovider = 'https://api.example.com/v1/responses',
-},
-model = {
-    ...
-    myprovider = 'my-model-name',
-},
-```
-
-The provider is then available via `provider = "myprovider"` in user config.
+The backend deliberately avoids shell pipelines; new providers should use Python `requests`, `json`, and in-process SSE parsing rather than `curl`, `jq`, `grep`, or `sed`.
 
 
 ## Suggested Improvements
@@ -369,8 +315,8 @@ WezTerm will re-fetch the plugin from the repository on next start.
 | No commands generated | Rephrase the prompt to be more specific |
 | OpenAI says response is incomplete with no assistant text | Increase `max_tokens`/`chat_max_tokens`; GPT-5 reasoning tokens count against `max_output_tokens` |
 | No syntax highlighting | Install [bat](https://github.com/sharkdp/bat) |
-| Streaming ask shows raw text | Install [streamdown](https://github.com/day50-dev/render-markdown-terminal): `uv tool install streamdown` |
-| `streamdown` command not found | Ensure `~/.local/bin` is in your PATH, or set `renderer` to the full path |
+| Streaming ask shows raw text | Install backend dependencies in the venv, or set `renderer = "cat"` intentionally |
+| Renderer command not found | Ensure the external renderer is in your PATH, or set `renderer` to the full path |
 
 ## Security
 

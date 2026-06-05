@@ -159,16 +159,5 @@ return function(auth, model, max_tokens, temperature)
             if text then return text end
             return nil, no_text_error(response)
         end,
-        stream_filter = table.concat({
-            "grep --line-buffered '^data: '",
-            "sed -u 's/^data: //'",
-            "grep -v '^\\[DONE\\]$'",
-            "jq --unbuffered -j 'select(.type == \"response.output_text.delta\") | .delta // empty'",
-        }, ' | '),
-        conversation_mode = 'messages',
-        body_template = '\'{ model: $model, instructions: $sys, input: ($history + [{ role: "user", content: $msg }]),'
-            .. ' max_output_tokens: $max_tokens, temperature: $temperature, stream: true, store: false'
-            .. (reasoning_effort_for_model(model) and ', reasoning: { effort: "low" }' or '')
-            .. ' }\'',
     }
 end

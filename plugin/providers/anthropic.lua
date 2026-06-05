@@ -41,13 +41,5 @@ return function(auth, model, max_tokens, temperature)
             end
             return nil, 'Error: No content found in Anthropic Messages API response'
         end,
-        stream_filter = table.concat({
-            "grep --line-buffered '^data: '",
-            "sed -u 's/^data: //'",
-            "jq --unbuffered -j 'select(.type == \"content_block_delta\") | .delta.text // empty'",
-        }, ' | '),
-        conversation_mode = 'messages',
-        body_template = '\'{ model: $model, max_tokens: $max_tokens, temperature: $temperature, stream: true,'
-            .. ' system: $sys, messages: ($history + [{ role: "user", content: $msg }]) }\'' ,
     }
 end

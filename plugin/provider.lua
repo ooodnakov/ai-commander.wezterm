@@ -9,11 +9,8 @@
 --           model             = model,
 --           max_tokens        = max_tokens,
 --           headers           = { { "Header-Name", "value" }, ... },
---           build_body        = function(system_message, messages) return { ... } end,
---           extract_response  = function(response) return text_or_nil, err_string end,
---           stream_filter     = "grep ... | sed ... | jq ...",
---           body_template     = "'{ jq template with $model, $max_tokens, $sys, $msg }'",
---           conversation_mode = "previous_response_id" or "messages" or nil,
+--           -- Lua-side provider metadata used for config diagnostics.
+--           -- Runtime API calls are handled by plugin/backend.py.
 --       }
 --   end
 --
@@ -32,15 +29,113 @@ local providers = {
 }
 
 local function command_available(command)
-    local ok, success = pcall(wezterm.run_child_process, {
-        'sh', '-lc', 'command -v ' .. wezterm.shell_quote_arg(command) .. ' >/dev/null 2>&1'
-    })
+    if not command or command == '' then return false end
+    local ok, success = pcall(wezterm.run_child_process, { command, '--version' })
     return ok and success
+end
+
+
+local function file_exists(path)
+    local f = io.open(path, 'r')
+    if not f then return false end
+    f:close()
+    return true
+end
+
+
+local function append_output_lines(add, status, prefix, output)
+    local any = false
+    for line in ((output or '') .. '\n'):gmatch("([^\r\n]*)\r?\n") do
+        if line ~= '' then
+            add(status, prefix .. line)
+            any = true
+        end
+    end
+    return any
 end
 
 local function renderer_command(renderer)
     if not renderer or renderer == '' then return nil end
     return tostring(renderer):match('^(%S+)')
+end
+
+local function readable(path)
+    local file = io.open(path, 'r')
+    if not file then return false end
+    file:close()
+    return true
+end
+
+local function search_module_path(module)
+    if package.searchpath then
+        local ok, path = pcall(package.searchpath, module, package.path)
+        if ok and path then return path end
+    end
+
+    local module_path = module:gsub('%.', '/')
+    for template in tostring(package.path or ''):gmatch('[^;]+') do
+        local candidate = template:gsub('%?', module_path)
+        if readable(candidate) then return candidate end
+    end
+
+    return nil
+end
+
+local function plugin_dir()
+    local path = search_module_path('provider')
+    if not path then return '.' end
+    return path:match('^(.*)[/\\][^/\\]+$') or '.'
+end
+
+local function backend_path()
+    return plugin_dir() .. '/backend.py'
+end
+
+local function write_temp_file(suffix, contents)
+    local path = os.tmpname() .. suffix
+    local file, err = io.open(path, 'w')
+    if not file then
+        return nil, 'Error: Failed to create temp file: ' .. tostring(err)
+    end
+    file:write(contents or '')
+    file:close()
+    return path
+end
+
+local function default_backend_python_candidates(config)
+    local candidates = {}
+    if config and config.backend_python and config.backend_python ~= '' then
+        table.insert(candidates, tostring(config.backend_python))
+    end
+
+    local env_python = os.getenv('WEZTERM_AI_COMMANDER_BACKEND_PYTHON')
+    if env_python and env_python ~= '' then
+        table.insert(candidates, env_python)
+    end
+
+    if wezterm.home_dir then
+        table.insert(candidates, wezterm.home_dir .. '/.local/share/ai-commander.wezterm/venv/bin/python')
+    end
+
+    table.insert(candidates, 'python')
+    table.insert(candidates, 'python3')
+    return candidates
+end
+
+function M.resolve_backend(config)
+    local candidates = default_backend_python_candidates(config)
+    for _, candidate in ipairs(candidates) do
+        local ok, success = pcall(wezterm.run_child_process, { candidate, '--version' })
+        if ok and success then
+            return candidate, backend_path()
+        end
+    end
+
+    return nil, 'Error: Python backend requires python. Set backend_python, install ~/.local/share/ai-commander.wezterm/venv, or install python/python3.'
+end
+
+function M.write_temp_file(suffix, contents)
+    return write_temp_file(suffix, contents)
 end
 
 -- Resolve provider details from config, returns (details, api_url, credential) or (nil, error_string)
@@ -70,188 +165,66 @@ local function resolve(config, opts)
     return details, api_url, credential
 end
 
-local function append_headers(curl_args, headers)
-    for _, h in ipairs(headers) do
-        table.insert(curl_args, '-H')
-        table.insert(curl_args, h[1] .. ': ' .. h[2])
-    end
-end
 
-local function is_codex_subscription_response(api_url, credential)
-    return credential
-        and credential.type == 'oauth'
-        and type(api_url) == 'string'
-        and api_url:find('chatgpt.com/backend-api/codex/responses', 1, true) ~= nil
-end
-
-local function prepare_codex_subscription_body(body)
-    body.stream = true
-    body.store = false
-
-    -- ChatGPT's Codex subscription endpoint is Responses-shaped, but stricter
-    -- than the public OpenAI Responses API. It rejects these public API fields.
-    body.max_output_tokens = nil
-    body.max_completion_tokens = nil
-    body.max_tokens = nil
-    body.temperature = nil
-    body.reasoning = nil
-
-    return body
-end
-
-
-local function extract_stream_response(stdout, details)
-    local parts = {}
-    local completed_response = nil
-    local failure = nil
-    local saw_event = false
-
-    for line in ((stdout or '') .. '\n'):gmatch("([^\r\n]*)\r?\n") do
-        local payload = line:match('^data:%s*(.*)$')
-        if payload and payload ~= '' and payload ~= '[DONE]' then
-            saw_event = true
-            local ok, event = pcall(wezterm.json_parse, payload)
-            if ok and type(event) == 'table' then
-                if event.type == 'response.output_text.delta' and type(event.delta) == 'string' then
-                    table.insert(parts, event.delta)
-                elseif event.type == 'response.output_text.done' and #parts == 0 and type(event.text) == 'string' then
-                    table.insert(parts, event.text)
-                elseif event.type == 'response.completed' and type(event.response) == 'table' then
-                    completed_response = event.response
-                elseif (event.type == 'response.failed' or event.type == 'error') and not failure then
-                    local err = event.error or (type(event.response) == 'table' and event.response.error)
-                    failure = 'API error: ' .. tostring(type(err) == 'table' and (err.message or err.code) or err or 'Unknown error')
-                end
-            end
-        end
-    end
-
-    if #parts > 0 then return table.concat(parts, ''), nil, true end
-    if completed_response then
-        local text, err = details.extract_response(completed_response)
-        return text, err, true
-    end
-    if failure then return nil, failure, true end
-    if saw_event then return nil, 'Error: Streaming response contained no assistant text', true end
-    return nil, nil, false
-end
-
--- Blocking API call via wezterm.run_child_process (for command generation)
+-- Blocking backend call via wezterm.run_child_process (for command generation)
 function M.call(config, system_message, user_message, callback, opts)
-    local details, api_url, credential = resolve(config, opts)
-    if not details then
-        callback(api_url)
+    local python, backend_or_err = M.resolve_backend(config)
+    if not python then
+        callback(backend_or_err)
         return
     end
 
-    local stream_response = is_codex_subscription_response(api_url, credential)
-    local messages = {{ role = "user", content = user_message }}
-    local body = details.build_body(system_message, messages)
-    if stream_response then
-        prepare_codex_subscription_body(body)
+    local backend_config = config or {}
+    if opts and opts.max_tokens then
+        backend_config = {}
+        for key, value in pairs(config or {}) do backend_config[key] = value end
+        backend_config.max_tokens = opts.max_tokens
     end
-    local json_body = wezterm.json_encode(body)
 
-    local curl_args = { 'curl', '-s', '--max-time', '120', '-X', 'POST' }
-    if stream_response then table.insert(curl_args, 3, '-N') end
-    append_headers(curl_args, details.headers)
-    table.insert(curl_args, api_url)
-    table.insert(curl_args, '-d')
-    table.insert(curl_args, json_body)
-
-    local success, stdout, stderr = wezterm.run_child_process(curl_args)
-    stdout = stdout or ''
-
-    if not success then
-        wezterm.log_error('HTTP request failed: ' .. (stderr or 'Unknown error'))
-        callback('Error: HTTP request failed. ' .. (stderr or 'Unknown error'))
+    local config_file, config_err = write_temp_file('_ai_commander_config.json', wezterm.json_encode(backend_config))
+    if not config_file then
+        callback('Error: Failed to write backend config: ' .. tostring(config_err))
         return
     end
 
-    if stream_response then
-        local text, stream_err, saw_stream = extract_stream_response(stdout, details)
-        if text then
-            callback(text)
-            return
-        elseif saw_stream then
-            callback(stream_err or 'Error: Streaming response contained no assistant text')
-            return
-        end
-    end
-
-    local ok, response = pcall(wezterm.json_parse, stdout)
-    if not ok then
-        callback('Error: Failed to parse API response: ' .. stdout:sub(1, 1500))
+    local system_file, system_err = write_temp_file('_ai_commander_system.txt', system_message or '')
+    if not system_file then
+        os.remove(config_file)
+        callback('Error: Failed to write backend system prompt: ' .. tostring(system_err))
         return
     end
 
-    if response.error then
-        callback('API error: ' .. (response.error.message or 'Unknown error'))
+    local prompt_file, prompt_err = write_temp_file('_ai_commander_prompt.txt', user_message or '')
+    if not prompt_file then
+        os.remove(config_file)
+        os.remove(system_file)
+        callback('Error: Failed to write backend prompt: ' .. tostring(prompt_err))
         return
     end
 
-    if response.detail then
-        callback('API error: ' .. tostring(response.detail))
+    local success, stdout, stderr = wezterm.run_child_process({
+        python, backend_or_err, 'generate',
+        '--config', config_file,
+        '--system', system_file,
+        '--prompt', prompt_file,
+    })
+
+    os.remove(config_file)
+    os.remove(system_file)
+    os.remove(prompt_file)
+
+    if success then
+        callback(stdout or '')
         return
     end
 
-    local text, extract_err = details.extract_response(response)
-    if text then
-        callback(text)
-    else
-        callback(extract_err)
-    end
+    local message = stderr
+    if not message or message == '' then message = stdout end
+    if not message or message == '' then message = 'backend exited unsuccessfully' end
+    wezterm.log_error('AI backend generate failed: ' .. tostring(message))
+    callback('Error: AI backend generate failed. ' .. tostring(message))
 end
 
--- Build a bash streaming curl pipeline string.
--- Expects $QUESTION and $HISTORY_JSON to be set in the calling script.
--- Returns: curl ... | optional tee | sse_filter
-function M.build_stream_cmd(config, system_prompt, opts)
-    opts = opts or {}
-    local details, api_url, credential = resolve(config, opts)
-    if not details then
-        return 'echo ' .. wezterm.shell_quote_arg(api_url)
-    end
-
-    local header_lines = {}
-    for _, h in ipairs(details.headers) do
-        table.insert(header_lines, '  -H ' .. wezterm.shell_quote_arg(h[1] .. ': ' .. h[2]) .. ' \\')
-    end
-
-    local jq_body
-    if is_codex_subscription_response(api_url, credential) then
-        jq_body = 'jq -n'
-            .. ' --arg sys ' .. wezterm.shell_quote_arg(system_prompt)
-            .. ' --arg msg "$QUESTION"'
-            .. ' --arg model ' .. wezterm.shell_quote_arg(details.model)
-            .. ' --argjson history "$HISTORY_JSON"'
-            .. ' ' .. '\'{ model: $model, instructions: $sys,'
-            .. ' input: ($history + [{ role: "user", content: $msg }]),'
-            .. ' stream: true, store: false }\''
-    else
-        jq_body = 'jq -n'
-            .. ' --arg sys ' .. wezterm.shell_quote_arg(system_prompt)
-            .. ' --arg msg "$QUESTION"'
-            .. ' --arg model ' .. wezterm.shell_quote_arg(details.model)
-            .. ' --argjson history "$HISTORY_JSON"'
-            .. ' --argjson max_tokens ' .. tostring(details.max_tokens)
-            .. ' --argjson temperature ' .. tostring(config.temperature or 0.1)
-            .. ' ' .. details.body_template
-    end
-
-    local capture = ''
-    if opts.capture_events then
-        capture = '  | tee "$EVENTS" \\\n'
-    end
-
-    return table.concat({
-        'curl -sN --max-time 120 -X POST \\',
-        table.concat(header_lines, '\n'),
-        '  ' .. wezterm.shell_quote_arg(api_url) .. ' \\',
-        '  -d "$(' .. jq_body .. ')" \\',
-        capture .. '  | ' .. details.stream_filter,
-    }, '\n')
-end
 
 function M.check(config, validation_warnings)
     local name = config.provider or 'anthropic'
@@ -277,44 +250,60 @@ function M.check(config, validation_warnings)
         add('❌', api_url)
     end
 
-    if command_available('curl') then
-        add('✅', 'curl is available')
+    local python, backend_or_err = M.resolve_backend(config)
+    if python then
+        add('✅', 'Python backend interpreter found: ' .. python)
     else
-        add('❌', 'curl is not available')
+        add('❌', backend_or_err)
     end
 
-    if command_available('jq') then
-        add('✅', 'jq is available')
+    local backend = python and backend_or_err or backend_path()
+    if file_exists(backend) then
+        add('✅', 'Python backend found: ' .. backend)
     else
-        add('❌', 'jq is not available; streaming ask mode requires jq')
+        add('❌', 'Python backend not found: ' .. backend)
     end
 
-    local renderer = renderer_command(config.renderer or 'streamdown')
-    if renderer == 'cat' then
-        add('✅', 'renderer is cat')
-    elseif renderer and command_available(renderer) then
-        add('✅', 'renderer is available: ' .. renderer)
-    else
-        add('⚠️', 'renderer not found: ' .. tostring(renderer) .. ' (set renderer = "cat" for plain text)')
-    end
+    if python and file_exists(backend) then
+        local temp_config, temp_err = write_temp_file('_ai_commander_config.json', wezterm.json_encode(config or {}))
+        if temp_config then
+            local child_ok, success, stdout, stderr = pcall(wezterm.run_child_process, {
+                python, backend, 'check', '--config', temp_config,
+            })
+            os.remove(temp_config)
 
-    if details and api_url and command_available('curl') then
-        local ok, success, stdout = pcall(wezterm.run_child_process, {
-            'curl', '-sS', '-o', '/dev/null', '-w', '%{http_code}',
-            '--connect-timeout', '5', '--max-time', '10', api_url,
-        })
-        if ok and success then
-            local code = tonumber(stdout)
-            if code and code >= 200 and code < 500 then
-                add('✅', 'endpoint is reachable (HTTP ' .. tostring(code) .. ')')
-            elseif code and code >= 500 then
-                add('⚠️', 'endpoint responded with server error HTTP ' .. tostring(code))
+            local output = table.concat({ stdout or '', stderr or '' }, '\n')
+            if child_ok and success then
+                add('✅', 'Backend check passed (provider auth, requests, rich, config)')
+                if not append_output_lines(add, 'ℹ️', 'backend: ', output) then
+                    add('ℹ️', 'backend: no diagnostic output')
+                end
+            elseif child_ok then
+                add('❌', 'Backend check failed (provider auth, requests, rich, config)')
+                if not append_output_lines(add, 'ℹ️', 'backend: ', output) then
+                    add('ℹ️', 'backend: no diagnostic output')
+                end
             else
-                add('⚠️', 'endpoint returned unexpected HTTP status: ' .. tostring(stdout))
+                add('❌', 'Backend check could not start: ' .. tostring(success))
             end
         else
-            add('❌', 'endpoint reachability check failed')
+            add('❌', 'Backend check could not write temp config: ' .. tostring(temp_err))
         end
+    else
+        add('ℹ️', 'requests/rich dependencies and endpoint reachability are checked by backend when Python backend is available')
+    end
+
+    local renderer = renderer_command(config.renderer)
+    if not renderer or renderer == 'rich' then
+        add('ℹ️', 'renderer: Python Rich markdown (requires backend dependencies)')
+    elseif renderer == 'streamdown' then
+        add('ℹ️', 'renderer optional: streamdown; raw markdown fallback remains available')
+    elseif renderer == 'cat' then
+        add('✅', 'renderer is cat')
+    elseif command_available(renderer) then
+        add('✅', 'renderer is available: ' .. renderer)
+    else
+        add('⚠️', 'configured renderer not found: ' .. tostring(renderer) .. ' (raw markdown fallback remains available)')
     end
 
     return {

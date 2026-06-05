@@ -29,7 +29,7 @@ assert_equal(body.temperature, 0.2, 'temperature')
 assert_equal(body.stream, false, 'blocking stream flag')
 assert_equal(body.store, false, 'blocking store flag')
 assert_equal(body.reasoning.effort, 'low', 'gpt-5 reasoning effort')
-assert(provider.body_template:find('reasoning: { effort: "low" }', 1, true), 'gpt-5 streaming body uses low reasoning')
+assert_equal(provider.body_template, nil, 'OpenAI provider no longer exposes shell body template')
 
 local text = provider.extract_response({ output_text = 'top' })
 assert_equal(text, 'top', 'top-level output_text')
@@ -72,6 +72,6 @@ assert_equal(
 local non_reasoning = factory({ headers = {} }, 'gpt-4.1', 20, 0.1)
 local non_reasoning_body = non_reasoning.build_body('sys', { { role = 'user', content = 'hi' } })
 assert_equal(non_reasoning_body.reasoning, nil, 'non-reasoning model omits reasoning')
-assert(not non_reasoning.body_template:find('reasoning:', 1, true), 'non-reasoning streaming body omits reasoning')
+assert_equal(non_reasoning.body_template, nil, 'non-reasoning provider has no shell body template')
 
 print('ok')

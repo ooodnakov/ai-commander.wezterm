@@ -15,10 +15,21 @@ end
 
 local function active_pane_for(window, pane)
     if window then
-        local ok, active = pcall(function()
+        -- Prefer mux active pane. GUI active_pane() may point at an InputSelector/
+        -- PromptInputLine overlay pane; send_text against that can fail with
+        -- "pane id ... not found in mux" after switching panes.
+        local ok_mux, mux_pane = pcall(function()
+            local mux_window = window:mux_window()
+            if mux_window then
+                return mux_window:active_pane()
+            end
+        end)
+        if ok_mux and mux_pane then return mux_pane end
+
+        local ok_gui, active = pcall(function()
             return window:active_pane()
         end)
-        if ok and active then return active end
+        if ok_gui and active then return active end
     end
     return pane
 end
@@ -64,17 +75,46 @@ function M.set_max_results_history(value)
     max_results_history = value
 end
 
--- Syntax-highlight a bash command string using bat (if available)
--- Returns the string with ANSI escape codes, or the original string as fallback
 local function highlight_bash(text)
-    local success, stdout, stderr = wezterm.run_child_process {
-        'bash', '-c', 'export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; printf %s ' .. wezterm.shell_quote_arg(text) .. ' | bat --language=bash --color=always --style=plain --paging=never 2>/dev/null',
-    }
-    if success and stdout and #stdout > 0 then
-        -- Remove trailing newline that bat adds
-        return stdout:gsub("[\r\n]+$", "")
+    local path = os.tmpname() .. '_ai_commander_command.sh'
+    local file = io.open(path, 'w')
+    if not file then return text end
+    file:write(text or '')
+    file:close()
+
+    local ok, success, stdout = pcall(wezterm.run_child_process, {
+        'bat', '--style=plain', '--color=always', '--language=bash', path
+    })
+    os.remove(path)
+    if ok and success and stdout and stdout ~= '' then
+        return stdout:gsub('\n+$', '')
     end
     return text
+end
+
+local function formatted(parts)
+    local ok, result = pcall(wezterm.format, parts)
+    if ok and result then return result end
+
+    local texts = {}
+    for _, part in ipairs(parts) do
+        if type(part) == 'table' and part.Text then texts[#texts + 1] = part.Text end
+    end
+    return table.concat(texts)
+end
+
+local function truncate_text(text, limit)
+    text = tostring(text or ''):gsub('%s+', ' ')
+    if #text <= limit then return text end
+    return text:sub(1, limit - 1) .. '…'
+end
+
+local function danger_badge(entry)
+    local haystack = ((entry.cmd or '') .. '\n' .. (entry.desc or '')):lower()
+    if haystack:find('rm%s+%-rf') or haystack:find('delete') or haystack:find('drop%s+') or haystack:find('kill%s+') then
+        return '  ⚠'
+    end
+    return ''
 end
 
 -- Helper to build a styled label for a command entry
@@ -82,27 +122,101 @@ local function build_command_label(entry)
     local first_line = entry.cmd:match("^([^\n]*)")
     local is_multiline = entry.cmd:find("\n") ~= nil
     local highlighted = highlight_bash(first_line)
-    local label
+    local multiline = is_multiline and '  ↵' or ''
+    local badge = danger_badge(entry)
 
     if entry.desc then
-        label = highlighted
-            .. (is_multiline and ' ...' or '')
-            .. wezterm.format {
-                'ResetAttributes',
-                { Foreground = { AnsiColor = 'Silver' } },
-                { Text = '  \u{2502} ' },
-                { Attribute = { Italic = true } },
-                { Text = entry.desc },
-            }
-    else
-        label = highlighted .. (is_multiline and ' ...' or '')
+        return formatted {
+            { Text = highlighted },
+            { Foreground = { AnsiColor = 'Aqua' } },
+            { Text = multiline },
+            { Foreground = { AnsiColor = 'Yellow' } },
+            { Text = badge },
+            'ResetAttributes',
+            { Foreground = { AnsiColor = 'Silver' } },
+            { Text = '  │ ' },
+            { Attribute = { Italic = true } },
+            { Text = truncate_text(entry.desc, 96) },
+        }
     end
-    return label
+
+    return formatted {
+        { Text = highlighted },
+        { Foreground = { AnsiColor = 'Aqua' } },
+        { Text = multiline },
+        { Foreground = { AnsiColor = 'Yellow' } },
+        { Text = badge },
+    }
 end
+
+local function show_generating_selector(user_prompt, context, window, pane)
+    local label = formatted {
+        { Foreground = { AnsiColor = 'Fuchsia' } },
+        { Attribute = { Intensity = 'Bold' } },
+        { Text = '⏳ Generating commands' },
+        'ResetAttributes',
+        { Foreground = { AnsiColor = 'Silver' } },
+        { Text = '  │ ' .. truncate_text(user_prompt, 72) },
+    }
+
+    local context_hint = context and context ~= '' and 'selected context included' or 'no selected context'
+    perform_action(
+        window,
+        pane,
+        act.InputSelector {
+            action = wezterm.action_callback(function() end),
+            title = 'AI Commander · Generating Commands',
+            choices = {
+                { id = '__waiting__', label = label },
+            },
+            description = 'Waiting for provider response… ' .. context_hint .. '. The command selector will replace this panel.',
+        }
+    )
+end
+
+local function schedule_after_ui(callback)
+    if wezterm.time and wezterm.time.call_after then
+        wezterm.time.call_after(0.05, callback)
+    else
+        callback()
+    end
+end
+
+local function window_theme(window)
+    if not window then return nil end
+
+    local ok, effective = pcall(function()
+        return window:effective_config()
+    end)
+    if not ok or not effective or not effective.colors then return nil end
+
+    local colors = effective.colors
+    local ansi = colors.ansi or {}
+    local brights = colors.brights or {}
+    return {
+        foreground = colors.foreground,
+        background = colors.background,
+        accent = brights[6] or ansi[6] or colors.cursor_bg,
+        accent2 = brights[7] or ansi[7] or colors.cursor_border,
+        muted = brights[1] or ansi[1],
+        success = brights[3] or ansi[3],
+        warning = brights[4] or ansi[4],
+    }
+end
+
+local function config_with_theme(config, window)
+    local themed = {}
+    for key, value in pairs(config or {}) do
+        themed[key] = value
+    end
+    themed.theme = window_theme(window)
+    return themed
+end
+
 
 -- Process a prompt with optional context: call AI, parse response, show selector
 local function process_prompt_with_context(user_prompt, context, window, pane)
-    local config = cfg.get()
+    local config = config_with_theme(cfg.get(), window)
     history.save(user_prompt)
 
     local api_prompt = table.concat({
@@ -144,18 +258,15 @@ local function process_prompt_with_context(user_prompt, context, window, pane)
     api_prompt = with_context(api_prompt, context)
 
     provider.call(config, config.system_prompt, api_prompt, function(response)
-        -- Parse response into command + description pairs
-        -- Description lines start with "## ". Everything between descriptions is the command
-        -- (which may span multiple lines for heredocs, pipelines, etc.)
+        -- Parse response into command + description pairs.
+        -- Description lines start with "## ". Everything between descriptions is the command.
         local commands = {}
         local current_lines = {}
 
         for line in (response .. "\n"):gmatch("([^\r\n]*)\r?\n") do
             local desc_match = line:match("^##%s+(.*)")
             if desc_match then
-                -- This is a description line; everything accumulated so far is the command
                 if #current_lines > 0 then
-                    -- Join command lines, trim trailing blank lines
                     while #current_lines > 0 and current_lines[#current_lines]:match("^%s*$") do
                         table.remove(current_lines)
                     end
@@ -166,14 +277,12 @@ local function process_prompt_with_context(user_prompt, context, window, pane)
                 end
                 current_lines = {}
             else
-                -- Accumulate command lines (skip leading blank lines between commands)
                 if #current_lines > 0 or not line:match("^%s*$") then
                     table.insert(current_lines, line)
                 end
             end
         end
 
-        -- Handle trailing command without a description
         while #current_lines > 0 and current_lines[#current_lines]:match("^%s*$") do
             table.remove(current_lines)
         end
@@ -187,19 +296,16 @@ local function process_prompt_with_context(user_prompt, context, window, pane)
             return
         end
 
-        -- Save results for later recall via show_last_results
         table.insert(last_results, 1, { prompt = user_prompt, commands = commands })
         while #last_results > max_results_history do
             table.remove(last_results)
         end
 
         if #commands == 1 then
-            -- If only one command, send it without showing selector
             send_text(window, pane, commands[1].cmd)
             return
         end
 
-        -- Build choices with styled labels: command + inline description
         local choices = {}
         for idx, entry in ipairs(commands) do
             table.insert(choices, {
@@ -220,9 +326,9 @@ local function process_prompt_with_context(user_prompt, context, window, pane)
                         end
                     end
                 end),
-                title = 'Select Command',
+                title = 'AI Commander · Choose Command',
                 choices = choices,
-                description = 'Choose a command to execute (press / to filter):',
+                description = 'Pick a command to paste into the pane. Press / to filter; multiline commands show ↵.',
             }
         )
     end)
@@ -237,12 +343,17 @@ function M.show_history(window, pane)
         return
     end
 
-    -- Create choices for history selection
     local choices = {}
     for i, hist_prompt in ipairs(hist) do
         table.insert(choices, {
             id = tostring(i),
-            label = hist_prompt
+            label = formatted {
+                { Foreground = { AnsiColor = 'Fuchsia' } },
+                { Attribute = { Intensity = 'Bold' } },
+                { Text = '❯ ' },
+                'ResetAttributes',
+                { Text = truncate_text(hist_prompt, 110) },
+            },
         })
     end
 
@@ -254,15 +365,17 @@ function M.show_history(window, pane)
                 if id then
                     local selected_prompt = hist[tonumber(id)]
                     if selected_prompt then
-                        -- Get selected text as context, just like in show_prompt
                         local selection = selection_text_for_pane(window, pane)
-                        process_prompt_with_context(selected_prompt, selection, window, pane)
+                        show_generating_selector(selected_prompt, selection, window, pane)
+                        schedule_after_ui(function()
+                            process_prompt_with_context(selected_prompt, selection, window, pane)
+                        end)
                     end
                 end
             end),
-            title = 'Select Previous Prompt',
+            title = 'AI Commander · Prompt History',
             choices = choices,
-            description = 'Choose a prompt from history:',
+            description = 'Choose a previous prompt to regenerate. Waiting panel stays visible while AI works.',
         }
     )
 end
@@ -270,34 +383,29 @@ end
 -- Show last AI results grouped by prompt
 function M.show_last_results(window, pane)
     if #last_results == 0 then
-        -- No previous results, fall back to showing prompt
         M.show_prompt(window, pane)
         return
     end
 
-    -- Build a flat list of choices grouped by prompt
     local choices = {}
-    -- Flat lookup: map choice id -> { cmd, result_index }
     local choice_map = {}
     local choice_id = 0
 
-    for ri, result in ipairs(last_results) do
-        -- Add a header entry for the prompt
-        local header_label = wezterm.format {
+    for _, result in ipairs(last_results) do
+        local header_label = formatted {
             { Foreground = { AnsiColor = 'Yellow' } },
             { Attribute = { Intensity = 'Bold' } },
-            { Text = '\u{2500}\u{2500} ' .. result.prompt .. ' \u{2500}\u{2500}' },
+            { Text = '── ' .. truncate_text(result.prompt, 96) .. ' ──' },
         }
         table.insert(choices, {
             id = '__header__',
             label = header_label,
         })
 
-        -- Add each command under this prompt
         for _, entry in ipairs(result.commands) do
             choice_id = choice_id + 1
             local id_str = tostring(choice_id)
-            choice_map[id_str] = { cmd = entry.cmd, result_index = ri }
+            choice_map[id_str] = { cmd = entry.cmd }
             table.insert(choices, {
                 id = id_str,
                 label = '  ' .. build_command_label(entry),
@@ -317,9 +425,9 @@ function M.show_last_results(window, pane)
                     end
                 end
             end),
-            title = 'Previous AI Results',
+            title = 'AI Commander · Previous Results',
             choices = choices,
-            description = 'Select a command from previous results (press / to filter):',
+            description = 'Pick a previously generated command. Press / to filter.',
         }
     )
 end
@@ -344,142 +452,102 @@ end
 
 -- Show prompt input and process the entered prompt
 function M.show_prompt(window, pane)
-    -- Get selected text as context
     local selection = selection_text_for_pane(window, pane)
-    local context_description = (selection and selection ~= "")
-        and "Enter prompt for command to generate (selected text will be used as context):"
-        or "Enter prompt for command to generate:"
+    local context_text = (selection and selection ~= '') and 'selected context: on' or 'selected context: off'
+    local context_description = formatted {
+        { Foreground = { AnsiColor = 'Fuchsia' } },
+        { Attribute = { Intensity = 'Bold' } },
+        { Text = 'AI Commander · Command Prompt' },
+        'ResetAttributes',
+        { Foreground = { AnsiColor = 'Silver' } },
+        { Text = '  │  ' },
+        { Foreground = { AnsiColor = 'Aqua' } },
+        { Text = context_text },
+        { Foreground = { AnsiColor = 'Silver' } },
+        { Text = '  │  describe shell task' },
+    }
 
     perform_action(
         window,
         pane,
         act.PromptInputLine {
             description = context_description,
+            prompt = formatted {
+                { Foreground = { AnsiColor = 'Fuchsia' } },
+                { Attribute = { Intensity = 'Bold' } },
+                { Text = '❯ ' },
+            },
             action = wezterm.action_callback(function(window, pane, line)
-                if not line then
+                if not line or line == '' then
                     return
                 end
 
-                process_prompt_with_context(line, selection, window, pane)
+                show_generating_selector(line, selection, window, pane)
+                schedule_after_ui(function()
+                    process_prompt_with_context(line, selection, window, pane)
+                end)
             end),
         }
     )
 end
 
--- Build a bash chat script that prompts inside the split pane and streams
--- each response through the configured markdown renderer.
---
--- The provider layer (provider.build_stream_cmd) produces a `curl ... | sse-filter`
--- fragment that emits raw model text on stdout, given $QUESTION in the env.
-local function build_streaming_script(config, context)
-    local renderer = config.renderer or 'streamdown'
-    local continuity_enabled = config.conversation_continuity and '1' or '0'
-    local state_file = config.conversation_state_file or (wezterm.home_dir .. '/.wezterm_ai_conversation_state.json')
-    local provider_name = config.provider or 'anthropic'
-    local max_messages = tostring(config.max_conversation_messages or 12)
-    local stream_cmd = provider.build_stream_cmd(config, config.chat_system_prompt,
-        { max_tokens = config.chat_max_tokens, capture_events = true })
+local function chat_backend_args(config, context)
+    local python, backend_or_err = provider.resolve_backend(config)
+    if not python then return nil, backend_or_err end
 
-    local function indent_block(text)
-        return '  ' .. text:gsub('\n', '\n  ')
+    local configfile, config_err = provider.write_temp_file('_ai_commander_config.json', wezterm.json_encode(config or {}))
+    if not configfile then return nil, config_err end
+
+    local contextfile, context_err = provider.write_temp_file('_ai_commander_context.txt', context or '')
+    if not contextfile then
+        os.remove(configfile)
+        return nil, context_err
     end
 
-    local continuity_config = table.concat({
-        'PROVIDER=' .. wezterm.shell_quote_arg(provider_name),
-        'CONTINUITY=' .. wezterm.shell_quote_arg(continuity_enabled),
-        'STATE_FILE=' .. wezterm.shell_quote_arg(state_file),
-        'MAX_CONVERSATION_MESSAGES=' .. wezterm.shell_quote_arg(max_messages),
-    }, '\n')
-
-    local continuity_prelude = table.concat({
-        'HISTORY_JSON="[]"',
-        'if [ "$CONTINUITY" = "1" ] && [ -f "$STATE_FILE" ]; then',
-        "  if jq -e --arg provider \"$PROVIDER\" '.provider == $provider' \"$STATE_FILE\" >/dev/null 2>&1; then",
-        "    HISTORY_JSON=$(jq -c '.messages // []' \"$STATE_FILE\")",
-        '  fi',
-        'fi',
-    }, '\n')
-
-    local continuity_epilogue = table.concat({
-        "UPDATED_HISTORY=$(jq -n -c --arg user \"$QUESTION\" --rawfile assistant \"$RAW\" --argjson history \"$HISTORY_JSON\" --argjson max \"$MAX_CONVERSATION_MESSAGES\" '(($history + [{role: \"user\", content: $user}, {role: \"assistant\", content: $assistant}]) | if length > $max then .[(length - $max):] else . end)' 2>/dev/null || true)",
-        'if [ -n "$UPDATED_HISTORY" ]; then',
-        '  HISTORY_JSON="$UPDATED_HISTORY"',
-        '  if [ "$CONTINUITY" = "1" ]; then',
-        '    mkdir -p "$(dirname "$STATE_FILE")"',
-        "    jq -n --arg provider \"$PROVIDER\" --argjson messages \"$HISTORY_JSON\" '{provider: $provider, messages: $messages}' > \"$STATE_FILE.tmp\" && mv \"$STATE_FILE.tmp\" \"$STATE_FILE\"",
-        '  fi',
-        'fi',
-    }, '\n')
-
-    return table.concat({
-        '#!/bin/bash',
-        'set -uo pipefail',
-        'export PATH="$HOME/.local/bin:$PATH"',
-        'CONTEXT=' .. wezterm.shell_quote_arg(context or ''),
-        continuity_config,
-        continuity_prelude,
-        'echo "AI Commander chat pane. Type /q, :q, quit, or exit to close."',
-        'printf "Renderer: %s\\n" ' .. wezterm.shell_quote_arg(renderer),
-        'if [ -n "$CONTEXT" ]; then echo "Selected pane text will be included as context."; fi',
-        'while true; do',
-        '  echo',
-        '  printf "Ask AI> "',
-        '  IFS= read -r QUESTION_INPUT || break',
-        '  case "$QUESTION_INPUT" in "" ) continue ;; "/q"|":q"|q|quit|exit ) break ;; esac',
-        '  if [ -n "$CONTEXT" ]; then',
-        '    QUESTION=$(printf "%s\\n\\nContext:\\n%s" "$QUESTION_INPUT" "$CONTEXT")',
-        '  else',
-        '    QUESTION="$QUESTION_INPUT"',
-        '  fi',
-        '  RAW=$(mktemp /tmp/ai_response_XXXXXX)',
-        '  EVENTS=$(mktemp /tmp/ai_events_XXXXXX)',
-        '  echo',
-        '  if ! ' .. stream_cmd:gsub('\n', '\n    ') .. ' \\',
-        '    | tee "$RAW" \\',
-        '    | ' .. renderer .. '; then',
-        '    echo',
-        '    echo "# AI request failed"',
-        '  else',
-        indent_block(continuity_epilogue),
-        '  fi',
-        '  rm -f "$RAW" "$EVENTS"',
-        'done',
-    }, '\n')
+    return {
+        python, backend_or_err, 'chat',
+        '--config', configfile,
+        '--context', contextfile,
+        '--delete-input-files',
+    }
 end
 
--- Run a script in a real split pane without zooming over the existing layout
-local function run_in_split(script, pane, window, config)
-    local scriptfile = os.tmpname() .. '_ask.sh'
-    local sf = io.open(scriptfile, 'w')
-    if sf then
-        sf:write(script)
-        sf:close()
-    end
-
+-- Run backend chat in a real split pane without zooming over the existing layout
+local function run_chat_backend(pane, window, config, context)
     local target = active_pane_for(window, pane)
-    if not target then return end
+    if not target then return nil end
+
+    local args, err = chat_backend_args(config, context)
+    if not args then return err end
 
     local ok, new_pane = pcall(function()
         return target:split {
             direction = 'Bottom',
-            args = { 'bash', scriptfile },
+            args = args,
             size = config.chat_pane_size,
         }
     end)
     if not ok then
+        os.remove(args[5])
+        os.remove(args[7])
         wezterm.log_warn('ai-commander: unable to split pane: ' .. tostring(new_pane))
-        return
+        return 'unable to split pane: ' .. tostring(new_pane)
     end
+    return nil
 end
 
 -- Open an interactive AI chat in a real split pane
 function M.show_ask_inline(window, pane)
     local selection = selection_text_for_pane(window, pane)
     local ok, err = pcall(function()
-        local config = cfg.get()
-        local script = build_streaming_script(config, selection)
-        run_in_split(script, pane, window, config)
+        local config = config_with_theme(cfg.get(), window)
+        return run_chat_backend(pane, window, config, selection)
     end)
+    if ok and err then
+        wezterm.log_error('ai-commander show_ask_inline: ' .. tostring(err))
+        send_text(window, pane, '# Error: ' .. tostring(err) .. '\n')
+        return
+    end
     if not ok then
         wezterm.log_error('ai-commander show_ask_inline: ' .. tostring(err))
         send_text(window, pane, '# Error: ' .. tostring(err) .. '\n')

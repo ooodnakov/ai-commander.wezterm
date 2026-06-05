@@ -1,14 +1,39 @@
 package.path = './plugin/?.lua;./plugin/?/init.lua;./?.lua;./?/init.lua;' .. package.path
 
-local split_script = nil
-local stream_opts = nil
+local split_opts = nil
+local encoded_values = {}
 
 local function assert_truthy(value, label)
     if not value then error(label, 2) end
 end
 
+local function assert_equal(actual, expected, label)
+    if actual ~= expected then
+        error(label .. ': expected ' .. tostring(expected) .. ', got ' .. tostring(actual), 2)
+    end
+end
+
 local function shell_quote_arg(value)
     return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function encode_json(value)
+    encoded_values[#encoded_values + 1] = value
+    if type(value) ~= 'table' then return '"' .. tostring(value) .. '"' end
+
+    local parts = {}
+    for key, item in pairs(value) do
+        local encoded
+        if type(item) == 'string' then
+            encoded = '"' .. item:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
+        elseif type(item) == 'table' then
+            encoded = encode_json(item)
+        else
+            encoded = tostring(item)
+        end
+        parts[#parts + 1] = '"' .. tostring(key) .. '":' .. encoded
+    end
+    return '{' .. table.concat(parts, ',') .. '}'
 end
 
 package.preload['wezterm'] = function()
@@ -17,6 +42,7 @@ package.preload['wezterm'] = function()
         action = {},
         action_callback = function(fn) return fn end,
         shell_quote_arg = shell_quote_arg,
+        json_encode = encode_json,
         format = function() return '' end,
         log_warn = function() end,
         log_error = function() end,
@@ -29,7 +55,7 @@ package.preload['config'] = function()
         get = function()
             return {
                 provider = 'openai',
-                renderer = 'streamdown',
+                renderer = 'rich',
                 chat_pane_size = 0.5,
                 chat_system_prompt = 'chat system',
                 chat_max_tokens = 1000,
@@ -48,9 +74,15 @@ end
 
 package.preload['provider'] = function()
     return {
-        build_stream_cmd = function(_, _, opts)
-            stream_opts = opts
-            return 'printf %s "$QUESTION"'
+        resolve_backend = function()
+            return 'python3', '/tmp/backend.py'
+        end,
+        write_temp_file = function(suffix, contents)
+            local path = os.tmpname() .. suffix
+            local file = assert(io.open(path, 'w'))
+            file:write(contents or '')
+            file:close()
+            return path
         end,
         check = function()
             return { message = 'ok' }
@@ -62,9 +94,9 @@ local ui = require('ui')
 
 local pane = {
     split = function(_, opts)
-        split_script = opts.args[2]
-        assert_truthy(opts.direction == 'Bottom', 'ask chat opens a bottom split')
-        assert_truthy(opts.size == 0.5, 'ask chat uses configured split size')
+        split_opts = opts
+        assert_equal(opts.direction, 'Bottom', 'ask chat opens a bottom split')
+        assert_equal(opts.size, 0.5, 'ask chat uses configured split size')
         return {}
     end,
     send_text = function() end,
@@ -72,25 +104,45 @@ local pane = {
 
 local window = {
     active_pane = function() return pane end,
-    get_selection_text_for_pane = function() return '' end,
+    get_selection_text_for_pane = function() return 'selected context' end,
 }
 
+local function arg_after(args, flag)
+    for index, arg in ipairs(args) do
+        if arg == flag then return args[index + 1] end
+    end
+end
+
 ui.show_ask_inline(window, pane)
-assert_truthy(split_script, 'ask chat writes a script for the split pane')
+assert_truthy(split_opts, 'ask chat spawns a split pane')
 
-local file = assert(io.open(split_script, 'r'))
-local script = file:read('*a')
-file:close()
+local args = split_opts.args
+assert_truthy(type(args) == 'table', 'ask chat uses argv table')
+local joined_args = table.concat(args, ' ')
 
-assert_truthy(script:find('while true; do', 1, true), 'ask chat remains interactive')
-assert_truthy(script:find('Ask AI>', 1, true), 'ask chat prompts inside the split pane')
-assert_truthy(script:find('Renderer: %s', 1, true), 'ask chat prints the selected renderer')
-assert_truthy(script:find('| streamdown', 1, true), 'ask chat pipes responses through streamdown')
-assert_truthy(stream_opts and stream_opts.capture_events == true, 'ask chat captures stream events for state')
-assert_truthy(script:find('jq -n -c', 1, true), 'ask chat updates history without waiting for stdin')
-assert_truthy(script:find('HISTORY_JSON="$UPDATED_HISTORY"', 1, true), 'ask chat keeps history in the split pane')
-assert_truthy(script:find('messages: $messages', 1, true), 'ask chat can persist messages when continuity is enabled')
-assert_truthy(not script:find('TogglePaneZoomState', 1, true), 'ask chat does not zoom over existing panes')
-assert_truthy(os.execute('bash -n ' .. shell_quote_arg(split_script)), 'generated ask chat script has valid bash syntax')
+assert_truthy(joined_args:find('python', 1, true), 'ask chat spawns Python')
+assert_truthy(joined_args:find('backend.py', 1, true), 'ask chat invokes backend.py')
+assert_truthy(joined_args:find(' chat ', 1, true) or args[3] == 'chat', 'ask chat uses backend chat command')
+assert_truthy(arg_after(args, '--config'), 'ask chat passes backend config file')
+assert_truthy(arg_after(args, '--context'), 'ask chat passes context file')
+assert_truthy(joined_args:find('--delete-input-files', 1, true), 'ask chat asks backend to clean temp files')
+assert_truthy(not joined_args:find('bash', 1, true), 'ask chat does not require bash')
+assert_truthy(not joined_args:find('curl', 1, true), 'ask chat does not require curl')
+assert_truthy(not joined_args:find('jq', 1, true), 'ask chat does not require jq')
+assert_truthy(not joined_args:find('|', 1, true), 'ask chat does not build a shell pipeline')
+assert_truthy(not joined_args:find('TogglePaneZoomState', 1, true), 'ask chat does not zoom over existing panes')
+
+local context_file = assert(io.open(arg_after(args, '--context'), 'r'))
+local context = context_file:read('*a')
+context_file:close()
+assert_equal(context, 'selected context', 'ask chat writes selected pane context')
+
+local config_file = assert(io.open(arg_after(args, '--config'), 'r'))
+local config_json = config_file:read('*a')
+config_file:close()
+assert_truthy(config_json:find('"provider":"openai"', 1, true), 'ask chat writes provider config')
+assert_truthy(config_json:find('"renderer":"rich"', 1, true), 'ask chat writes renderer config')
+assert_truthy(config_json:find('"chat_system_prompt":"chat system"', 1, true), 'ask chat writes system prompt')
+assert_truthy(config_json:find('"chat_max_tokens":1000', 1, true), 'ask chat writes max token config')
 
 print('ok')

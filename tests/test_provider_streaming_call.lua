@@ -1,7 +1,8 @@
 package.path = './plugin/?.lua;./plugin/?/init.lua;./?.lua;./?/init.lua;' .. package.path
 
-local last_body = nil
 local last_args = nil
+local encoded_config = nil
+local json_depth = 0
 
 local function assert_equal(actual, expected, label)
     if actual ~= expected then
@@ -9,32 +10,45 @@ local function assert_equal(actual, expected, label)
     end
 end
 
-local function unescape_json_string(value)
-    return (value or ''):gsub('\\n', '\n'):gsub('\\"', '"')
+local function assert_truthy(value, label)
+    if not value then error(label, 2) end
+end
+
+local function shell_quote_arg(value)
+    return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function encode_json(value)
+    if json_depth == 0 then encoded_config = value end
+    if type(value) ~= 'table' then return '"' .. tostring(value) .. '"' end
+
+    json_depth = json_depth + 1
+    local parts = {}
+    for key, item in pairs(value) do
+        local encoded
+        if type(item) == 'string' then
+            encoded = '"' .. item:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n') .. '"'
+        elseif type(item) == 'table' then
+            encoded = encode_json(item)
+        else
+            encoded = tostring(item)
+        end
+        parts[#parts + 1] = '"' .. tostring(key) .. '":' .. encoded
+    end
+    json_depth = json_depth - 1
+    return '{' .. table.concat(parts, ',') .. '}'
 end
 
 package.preload['wezterm'] = function()
     return {
-        json_encode = function(value)
-            last_body = value
-            return '{}'
-        end,
-        json_parse = function(raw)
-            if raw:find('response.output_text.delta', 1, true) then
-                return {
-                    type = 'response.output_text.delta',
-                    delta = unescape_json_string(raw:match('"delta"%s*:%s*"(.-)"')),
-                }
-            end
-            if raw:find('response.completed', 1, true) then
-                return { type = 'response.completed', response = { output = {} } }
-            end
-            error('unexpected json_parse input: ' .. tostring(raw))
-        end,
-        shell_quote_arg = function(value)
-            return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
-        end,
+        home_dir = '/tmp',
+        json_encode = encode_json,
+        shell_quote_arg = shell_quote_arg,
         log_error = function() end,
+        run_child_process = function(args)
+            last_args = args
+            return true, 'printf ok\n## Print ok', ''
+        end,
     }
 end
 
@@ -49,17 +63,11 @@ package.preload['auth'] = function()
     }
 end
 
-local provider = require('provider')
+local original_debug = debug
+debug = nil
 
-package.loaded['wezterm'].run_child_process = function(args)
-    last_args = args
-    return true, table.concat({
-        'data: {"type":"response.output_text.delta","delta":"printf ok"}',
-        'data: {"type":"response.output_text.delta","delta":"\\n## Print ok"}',
-        'data: {"type":"response.completed","response":{"status":"completed","output":[]}}',
-        'data: [DONE]',
-    }, '\n'), ''
-end
+local provider = require('provider')
+debug = original_debug
 
 local callback_text = nil
 provider.call({
@@ -73,32 +81,25 @@ provider.call({
     callback_text = text
 end)
 
-assert_equal(last_body.stream, true, 'codex subscription calls stream')
-assert_equal(last_body.store, false, 'codex subscription disables response storage')
-assert_equal(last_body.max_output_tokens, nil, 'codex subscription omits public max_output_tokens')
-assert_equal(last_body.temperature, nil, 'codex subscription omits public temperature')
-assert_equal(last_body.reasoning, nil, 'codex subscription omits public reasoning')
-assert_equal(callback_text, 'printf ok\n## Print ok', 'streamed delta text')
+assert_equal(callback_text, 'printf ok\n## Print ok', 'backend stdout is streamed to callback')
+assert_truthy(type(last_args) == 'table', 'provider calls backend with argv table')
 
-local has_no_buffer = false
-for _, arg in ipairs(last_args) do
-    if arg == '-N' then has_no_buffer = true end
-end
-assert_equal(has_no_buffer, true, 'curl disables buffering for stream')
+local joined_args = table.concat(last_args, ' ')
+assert_truthy(joined_args:find('python', 1, true), 'provider spawns Python')
+assert_truthy(joined_args:find('backend.py', 1, true), 'provider invokes backend.py')
+assert_truthy(joined_args:find(' generate ', 1, true) or last_args[3] == 'generate', 'provider uses backend generate command')
+assert_truthy(joined_args:find('--config', 1, true), 'provider passes config temp file')
+assert_truthy(joined_args:find('--system', 1, true), 'provider passes system temp file')
+assert_truthy(joined_args:find('--prompt', 1, true), 'provider passes prompt temp file')
+assert_truthy(not joined_args:find('curl', 1, true), 'provider core path does not require curl')
+assert_truthy(not joined_args:find('bash', 1, true), 'provider core path does not require bash')
+assert_truthy(not joined_args:find('jq', 1, true), 'provider core path does not require jq')
+assert_truthy(not joined_args:find('|', 1, true), 'provider core path does not build shell pipeline')
 
-local stream_cmd = provider.build_stream_cmd({
-    provider = 'openai',
-    api_url = { openai = 'https://api.openai.com/v1/responses' },
-    subscription_api_url = { openai = 'https://chatgpt.com/backend-api/codex/responses' },
-    model = { openai = 'gpt-5.5' },
-    max_tokens = 200,
-    temperature = 0.1,
-}, 'sys')
-
-assert_equal(stream_cmd:find('max_output_tokens', 1, true), nil, 'ask mode omits public max_output_tokens')
-assert_equal(stream_cmd:find('temperature', 1, true), nil, 'ask mode omits public temperature')
-assert_equal(stream_cmd:find('previous_response_id', 1, true), nil, 'ask mode does not use unsupported previous_response_id')
-assert(stream_cmd:find('input: ($history +', 1, true), 'ask mode sends accumulated chat history')
-assert(stream_cmd:find('store: false', 1, true), 'ask mode disables response storage')
+assert_truthy(encoded_config, 'provider writes backend config')
+assert_equal(encoded_config.provider, 'openai', 'backend config provider')
+assert_equal(encoded_config.model.openai, 'gpt-5.5', 'backend config model')
+assert_equal(encoded_config.max_tokens, 200, 'backend config max tokens')
+assert_equal(encoded_config.temperature, 0.1, 'backend config temperature')
 
 print('ok')
