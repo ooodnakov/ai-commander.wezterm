@@ -213,6 +213,153 @@ local function config_with_theme(config, window)
     return themed
 end
 
+local completion_status = nil
+local completion_status_registered = false
+
+local function completion_status_ttl(state)
+    if state == 'working' then return 120 end
+    return 3
+end
+
+local function completion_indicator_parts(status)
+    if not status then return nil end
+    if status.expires_at and os.time() > status.expires_at then
+        completion_status = nil
+        return nil
+    end
+
+    return {
+        { Foreground = { AnsiColor = status.color } },
+        { Attribute = { Intensity = 'Bold' } },
+        { Text = status.icon .. ' ' .. status.label },
+        'ResetAttributes',
+        { Foreground = { AnsiColor = 'Silver' } },
+        { Text = '  │  ' .. truncate_text(status.prefix or '', 48) },
+    }
+end
+
+local function render_completion_indicator(window)
+    local parts = completion_indicator_parts(completion_status)
+    if not parts or not window then return false end
+
+    local ok = pcall(function()
+        window:set_right_status(formatted(parts))
+    end)
+    return ok
+end
+
+function M.setup_completion_indicator()
+    if completion_status_registered then return end
+    completion_status_registered = true
+
+    if not wezterm.on then return end
+    wezterm.on('update-status', function(window)
+        render_completion_indicator(window)
+    end)
+end
+
+local function set_completion_indicator(window, state, prefix)
+    if not window then return end
+
+    local icon = state == 'done' and '✓' or (state == 'empty' and '∅' or '󰚩')
+    local color = state == 'done' and 'Green' or (state == 'empty' and 'Yellow' or 'Aqua')
+    local label = state == 'done' and 'AI completion inserted'
+        or (state == 'empty' and 'AI found no completion' or 'AI completing command…')
+
+    completion_status = {
+        icon = icon,
+        color = color,
+        label = label,
+        prefix = prefix,
+        expires_at = os.time() + completion_status_ttl(state),
+    }
+
+    if not render_completion_indicator(window) then
+        pcall(function()
+            window:toast_notification('AI Commander', label, nil, 1500)
+        end)
+    end
+end
+
+local function last_line(text)
+    local value = tostring(text or ''):gsub('\r', '')
+    return value:match('.*\n([^\n]*)$') or value
+end
+
+local function strip_common_prompt(line)
+    line = last_line(line)
+    local stripped = line:match('^%s*❯%s*(.*)$')
+    if stripped then return stripped end
+
+    stripped = line:match('^%s*[>$#%%λ]%s*(.*)$')
+    if stripped then return stripped end
+
+    stripped = line:match('^.*[%]%)}][%s]*[>$#%%]%s+(.*)$')
+    if stripped then return stripped end
+
+    stripped = line:match('^.*[%w_.%-]+@[%w_.%-]+.-[>$#%%]%s+(.*)$')
+    if stripped then return stripped end
+
+    return line:gsub('^%s+', '')
+end
+
+local function current_command_prefix(window, pane)
+    local target = active_pane_for(window, pane)
+    if not target then return nil, nil end
+
+    local ok_cursor, cursor = pcall(function()
+        return target:get_cursor_position()
+    end)
+    if ok_cursor and cursor and cursor.y then
+        local end_x = cursor.x or 0
+        if end_x < 1 then end_x = 1 end
+        local ok_region, text = pcall(function()
+            return target:get_text_from_region(0, cursor.y, end_x, cursor.y)
+        end)
+        if ok_region and text and text ~= '' then
+            local raw = last_line(text)
+            return strip_common_prompt(raw), raw
+        end
+    end
+
+    local ok_line, text = pcall(function()
+        return target:get_lines_as_text(1)
+    end)
+    if ok_line and text and text ~= '' then
+        local raw = last_line(text)
+        return strip_common_prompt(raw), raw
+    end
+
+    return nil, nil
+end
+
+local function sanitize_completion(response, prefix, raw_line)
+    local text = tostring(response or ''):gsub('\r', '')
+    text = text:gsub('^```[^\n]*\n', ''):gsub('\n```%s*$', '')
+    local inline = text:match('^%s*`([^`]+)`%s*$')
+    if inline then text = inline end
+    text = text:gsub('^\n+', ''):gsub('\n+$', '')
+
+    local trimmed = text:match('^%s*(.-)%s*$') or ''
+    if trimmed:match('^Error:') then return '' end
+    if prefix and prefix ~= '' and text:sub(1, #prefix) == prefix then
+        return text:sub(#prefix + 1)
+    end
+    if raw_line and raw_line ~= '' and text:sub(1, #raw_line) == raw_line then
+        return text:sub(#raw_line + 1)
+    end
+    return text
+end
+
+local completion_system_prompt = table.concat({
+    'You complete partially typed shell commands.',
+    'Return only the exact suffix to append at the cursor.',
+    'Do not repeat existing text unless no shorter suffix is possible.',
+    'Do not include markdown, quotes, explanations, or trailing newline.',
+    'Prefer safe, boring, idiomatic shell completions.',
+    'If there is no useful safe completion, return an empty response.',
+}, '\n')
+
 
 -- Process a prompt with optional context: call AI, parse response, show selector
 local function process_prompt_with_context(user_prompt, context, window, pane)
@@ -448,6 +595,56 @@ selection_text_for_pane = function(window, pane)
 
     if selection == '' then return nil end
     return selection
+end
+
+function M.complete_current_command(window, pane)
+    local target = active_pane_for(window, pane)
+    if not target then return end
+
+    local prefix, raw_line = current_command_prefix(window, target)
+    if not prefix or prefix == '' then return end
+
+    local cwd = ''
+    local ok_cwd, cwd_value = pcall(function()
+        return target:get_current_working_dir()
+    end)
+    if ok_cwd and cwd_value then cwd = tostring(cwd_value) end
+
+    local process_name = ''
+    local ok_process, process_value = pcall(function()
+        return target:get_foreground_process_name()
+    end)
+    if ok_process and process_value then process_name = tostring(process_value) end
+
+    local prompt = table.concat({
+        'Current terminal line, including prompt if visible:',
+        raw_line or '',
+        '',
+        'Editable command prefix:',
+        prefix,
+        '',
+        'Current working directory:',
+        cwd,
+        '',
+        'Foreground process:',
+        process_name,
+        '',
+        'Return only the suffix to append to the editable command prefix.',
+    }, '\n')
+
+    local config = config_with_theme(cfg.get(), window)
+    set_completion_indicator(window, 'working', prefix)
+    schedule_after_ui(function()
+        provider.call(config, completion_system_prompt, prompt, function(response)
+            local completion = sanitize_completion(response, prefix, raw_line)
+            if completion and completion ~= '' then
+                send_text(window, target, completion)
+                set_completion_indicator(window, 'done', prefix .. completion)
+            else
+                set_completion_indicator(window, 'empty', prefix)
+            end
+        end, { max_tokens = 160 })
+    end)
 end
 
 -- Show prompt input and process the entered prompt

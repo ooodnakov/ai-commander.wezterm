@@ -60,6 +60,7 @@ function M.apply_to_config(wezterm_config, plugin_config)
         end
         cfg.apply(plugin_config)
     end
+    ui.setup_completion_indicator()
 end
 
 -- Show prompt input for generating new commands
@@ -80,6 +81,11 @@ end
 -- Open an interactive split-pane AI chat with streaming markdown rendering
 function M.show_ask_inline(window, pane)
     ui.show_ask_inline(window, pane)
+end
+
+-- Complete the current shell command line in-place
+function M.complete_current_command(window, pane)
+    ui.complete_current_command(window, pane)
 end
 
 -- Validate provider configuration and local dependencies

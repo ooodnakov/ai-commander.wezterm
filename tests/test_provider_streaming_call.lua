@@ -84,6 +84,13 @@ end)
 assert_equal(callback_text, 'printf ok\n## Print ok', 'backend stdout is streamed to callback')
 assert_truthy(type(last_args) == 'table', 'provider calls backend with argv table')
 
+local function has_arg(value)
+    for _, arg in ipairs(last_args) do
+        if arg == value then return true end
+    end
+    return false
+end
+
 local joined_args = table.concat(last_args, ' ')
 assert_truthy(joined_args:find('python', 1, true), 'provider spawns Python')
 assert_truthy(joined_args:find('backend.py', 1, true), 'provider invokes backend.py')
@@ -91,10 +98,10 @@ assert_truthy(joined_args:find(' generate ', 1, true) or last_args[3] == 'genera
 assert_truthy(joined_args:find('--config', 1, true), 'provider passes config temp file')
 assert_truthy(joined_args:find('--system', 1, true), 'provider passes system temp file')
 assert_truthy(joined_args:find('--prompt', 1, true), 'provider passes prompt temp file')
-assert_truthy(not joined_args:find('curl', 1, true), 'provider core path does not require curl')
-assert_truthy(not joined_args:find('bash', 1, true), 'provider core path does not require bash')
-assert_truthy(not joined_args:find('jq', 1, true), 'provider core path does not require jq')
-assert_truthy(not joined_args:find('|', 1, true), 'provider core path does not build shell pipeline')
+assert_truthy(not has_arg('curl'), 'provider core path does not require curl')
+assert_truthy(not has_arg('bash'), 'provider core path does not require bash')
+assert_truthy(not has_arg('jq'), 'provider core path does not require jq')
+assert_truthy(not has_arg('|'), 'provider core path does not build shell pipeline')
 
 assert_truthy(encoded_config, 'provider writes backend config')
 assert_equal(encoded_config.provider, 'openai', 'backend config provider')

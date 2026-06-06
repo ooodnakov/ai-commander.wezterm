@@ -2,8 +2,11 @@ package.path = './plugin/?.lua;./plugin/?/init.lua;./?.lua;./?/init.lua;' .. pac
 
 local actions = {}
 local timers = {}
+local event_handlers = {}
+local right_statuses = {}
 local provider_called_after_waiting = false
 local sent_text = ''
+local completion_prompt = nil
 
 local function assert_truthy(value, label)
     if not value then error(label, 2) end
@@ -44,6 +47,9 @@ package.preload['wezterm'] = function()
                 timers[#timers + 1] = callback
             end,
         },
+        on = function(name, callback)
+            event_handlers[name] = callback
+        end,
     }
 end
 
@@ -67,7 +73,12 @@ end
 
 package.preload['provider'] = function()
     return {
-        call = function(_, _, _, callback)
+        call = function(_, system, prompt, callback)
+            if system:find('partially typed shell commands', 1, true) then
+                completion_prompt = prompt
+                callback(' status')
+                return
+            end
             provider_called_after_waiting = actions[#actions] and actions[#actions].title == 'AI Commander · Generating Commands'
             callback('printf ok\n## Print ok\nprintf nope\n## Print nope')
         end,
@@ -78,6 +89,9 @@ package.preload['provider'] = function()
 end
 
 local ui = require('ui')
+ui.setup_completion_indicator()
+assert_truthy(event_handlers['update-status'], 'completion status registers update-status overlay')
+
 
 local stale_pane = {
     send_text = function()
@@ -88,6 +102,22 @@ local stale_pane = {
 local mux_pane = {
     send_text = function(_, text)
         sent_text = sent_text .. text
+    end,
+    get_cursor_position = function()
+        return { x = 9, y = 10 }
+    end,
+    get_text_from_region = function(_, start_x, start_y, end_x, end_y)
+        assert_equal(start_x, 0, 'completion reads current line from start')
+        assert_equal(start_y, 10, 'completion reads cursor row')
+        assert_equal(end_y, 10, 'completion reads only cursor row')
+        assert_truthy(end_x >= 1, 'completion uses cursor column')
+        return '❯ git'
+    end,
+    get_current_working_dir = function()
+        return 'file:///home/odnakov/src/ai-commander.wezterm'
+    end,
+    get_foreground_process_name = function()
+        return 'zsh'
     end,
 }
 
@@ -105,6 +135,9 @@ local window = {
     perform_action = function(_, action, pane)
         assert_equal(pane, mux_pane, 'actions target mux active pane')
         actions[#actions + 1] = action
+    end,
+    set_right_status = function(_, value)
+        right_statuses[#right_statuses + 1] = value
     end,
 }
 
@@ -136,5 +169,16 @@ ui.show_last_results(window, stale_pane)
 assert_equal(actions[4].title, 'AI Commander · Previous Results', 'previous results selector title')
 actions[4].action(window, stale_pane, '2')
 assert_equal(sent_text, 'printf okprintf nope', 'previous results selector uses mux active pane')
+
+ui.complete_current_command(window, stale_pane)
+assert_equal(#timers, 2, 'completion provider call is delayed so indicator can render')
+assert_truthy(right_statuses[#right_statuses]:find('AI completing command', 1, true), 'completion shows working indicator')
+window:set_right_status('normal status overwrite')
+event_handlers['update-status'](window, mux_pane)
+assert_truthy(right_statuses[#right_statuses]:find('AI completing command', 1, true), 'completion indicator survives status refresh')
+timers[2]()
+assert_truthy(completion_prompt:find('Editable command prefix:\ngit', 1, true), 'completion prompt strips shell prompt')
+assert_equal(sent_text, 'printf okprintf nope status', 'completion appends only suffix')
+assert_truthy(right_statuses[#right_statuses]:find('AI completion inserted', 1, true), 'completion shows inserted indicator')
 
 print('ok')

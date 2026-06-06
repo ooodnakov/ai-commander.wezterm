@@ -69,6 +69,7 @@ config.keys = {
   { key = 'X', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_last_results(w, p) end) },
   { key = 'H', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_history(w, p) end) },
   { key = 'A', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_ask_inline(w, p) end) },
+  { key = 'E', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.complete_current_command(w, p) end) },
   { key = 'P', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.check_provider(w, p) end) },
 }
 
@@ -83,6 +84,7 @@ return config
 | `show_last_results(w, p)` | `Ctrl+Shift+X`      | Recall previously generated commands           |
 | `show_history(w, p)`      | `Alt+Shift+H`       | Browse and re-run previous prompts             |
 | `show_ask_inline(w, p)`   | `Ctrl+Shift+A`      | Ask AI a question, stream response in split pane |
+| `complete_current_command(w, p)` | `Ctrl+Shift+E` | Complete the currently typed shell command |
 | `check_provider(w, p)`     | `Ctrl+Shift+P`      | Validate credentials, endpoint, dependencies, and config |
 
 ### Command Generation
@@ -91,6 +93,12 @@ return config
 2. AI Commander keeps a branded “Generating Commands” selector open while the backend works
 3. Pick one of the styled command options from the selector (press `/` to filter; `↵` marks multiline commands)
 4. The command is inserted into your terminal
+
+### Command Completion
+
+1. Type the beginning of a shell command in your pane, e.g. `git che`
+2. Press `Ctrl+Shift+E`
+3. AI Commander appends only the missing suffix at the cursor
 
 ### Streaming Ask
 
