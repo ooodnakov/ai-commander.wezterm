@@ -45,10 +45,12 @@ package.preload['wezterm'] = function()
     }
 end
 
+local test_config = { command_count = 2, system_prompt = 'system', max_tokens = 100, command_context_output_lines = 3, command_context_output_chars = 120 }
+
 package.preload['config'] = function()
     return {
         get = function()
-            return { command_count = 2, system_prompt = 'system', max_tokens = 100 }
+            return test_config
         end,
         validate = function() return {} end,
     }
@@ -76,9 +78,17 @@ local pane = {
     send_text = function(_, text) sent_text = sent_text .. text end,
     get_cursor_position = function() return { x = 12, y = 3 } end,
     get_text_from_region = function() return '❯ git status' end,
-    get_lines_as_text = function() return '❯ git status' end,
+    get_lines_as_text = function(_, count)
+        if count == 1 then return '❯ git status' end
+        return table.concat({
+            'docker compose up',
+            'ERROR: service "web" failed healthcheck',
+            '❯ git status',
+        }, '\n')
+    end,
     get_current_working_dir = function() return 'file:///tmp/project%20space' end,
     get_foreground_process_name = function() return '/bin/zsh' end,
+    get_dimensions = function() return { cols = 80 } end,
 }
 
 local window = {
@@ -106,6 +116,8 @@ assert_truthy(provider_prompts[1]:find('Selected terminal text:\nselected error 
 assert_truthy(provider_prompts[1]:find('Current working directory: /tmp/project space', 1, true), 'cwd shell context is included')
 assert_truthy(provider_prompts[1]:find('Foreground process/shell: zsh', 1, true), 'foreground shell context is included')
 assert_truthy(provider_prompts[1]:find('Stripped current command line: git status', 1, true), 'current command line context is included')
+assert_truthy(provider_prompts[1]:find('Recent terminal output:\ndocker compose up\nERROR: service "web" failed healthcheck', 1, true), 'recent terminal output is included')
+assert_equal(provider_prompts[1]:find('Recent terminal output:.-git status'), nil, 'recent terminal output omits current command line')
 assert_equal(saved_prompts[1], 'edited prompt', 'edited history prompt is saved')
 
 assert_equal(actions[4].title, 'AI Commander · Choose Command', 'generated commands open selector')
@@ -117,11 +129,13 @@ assert_equal(sent_text, '', 'dangerous command cancel keeps pane unchanged')
 actions[5].action(window, pane, 'insert')
 assert_equal(sent_text, 'rm -rf /tmp/ai-commander-test', 'dangerous command inserts only after explicit confirmation')
 
+test_config.command_context_output_lines = 0
 ui.repeat_last_prompt(window, pane)
 assert_equal(actions[6].title, 'AI Commander · Generating Commands', 'repeat-last skips edit UI')
 assert_equal(#timers, 2, 'repeat-last schedules provider with current context')
 timers[2]()
 assert_truthy(provider_prompts[2]:find('Task: old destructive prompt', 1, true), 'repeat-last uses most recent history prompt')
+assert_equal(provider_prompts[2]:find('Recent terminal output:', 1, true), nil, 'output context can be disabled')
 assert_equal(#saved_prompts, 1, 'repeat-last does not duplicate history entry')
 
 print('ok')
