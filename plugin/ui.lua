@@ -626,6 +626,70 @@ local function foreground_process_for(target)
     return process:match('([^/]+)$') or process
 end
 
+local DEFAULT_COMMAND_CONTEXT_OUTPUT_LINES = 40
+local DEFAULT_COMMAND_CONTEXT_OUTPUT_CHARS = 6000
+
+local function bounded_nonnegative_integer(value, fallback)
+    local number = tonumber(value)
+    if number == nil then return fallback end
+    number = math.floor(number)
+    if number < 0 then return 0 end
+    return number
+end
+
+local function line_matches_current_command(line, raw_line, prefix)
+    local text = tostring(line or ''):match('^%s*(.-)%s*$') or ''
+    local raw = tostring(raw_line or ''):match('^%s*(.-)%s*$') or ''
+    if raw ~= '' and text == raw then return true end
+
+    local stripped = strip_common_prompt(text):match('^%s*(.-)%s*$') or ''
+    local command = tostring(prefix or ''):match('^%s*(.-)%s*$') or ''
+    return command ~= '' and stripped == command
+end
+
+local function recent_terminal_output_for(target, raw_line, prefix, config)
+    local line_limit = bounded_nonnegative_integer(
+        config and config.command_context_output_lines,
+        DEFAULT_COMMAND_CONTEXT_OUTPUT_LINES
+    )
+    local char_limit = bounded_nonnegative_integer(
+        config and config.command_context_output_chars,
+        DEFAULT_COMMAND_CONTEXT_OUTPUT_CHARS
+    )
+    if line_limit <= 0 or char_limit <= 0 then return '' end
+
+    local ok_dimensions, dimensions = pcall(function()
+        return target:get_dimensions()
+    end)
+    if ok_dimensions and dimensions and (dimensions.is_alt_screen or dimensions.alt_screen or dimensions.alternate_screen) then
+        return ''
+    end
+
+    local ok_recent, recent = pcall(function()
+        return target:get_lines_as_text(line_limit)
+    end)
+    if not ok_recent or not recent or recent == '' then return '' end
+
+    local lines = split_lines(tostring(recent):gsub('\r', ''))
+    while #lines > 0 and (lines[#lines]:match('^%s*$') or line_matches_current_command(lines[#lines], raw_line, prefix)) do
+        table.remove(lines)
+    end
+    while #lines > 0 and lines[1]:match('^%s*$') do
+        table.remove(lines, 1)
+    end
+    if #lines == 0 then return '' end
+
+    local output = table.concat(lines, '\n')
+    if #output > char_limit then
+        output = output:sub(#output - char_limit + 1)
+        local first_newline = output:find('\n', 1, true)
+        if first_newline and first_newline < #output then
+            output = output:sub(first_newline + 1)
+        end
+    end
+    return output
+end
+
 local function read_first_line(path)
     local file = io.open(path, 'r')
     if not file then return nil end
@@ -664,7 +728,7 @@ local function git_branch_for(cwd)
     return nil
 end
 
-local function terminal_context_for(window, pane)
+local function terminal_context_for(window, pane, config)
     local target = active_pane_for(window, pane)
     if not target then return '' end
 
@@ -679,18 +743,19 @@ local function terminal_context_for(window, pane)
     if process then table.insert(lines, 'Foreground process/shell: ' .. process) end
     if raw_line and raw_line ~= '' then table.insert(lines, 'Visible prompt/current line: ' .. raw_line) end
     if prefix and prefix ~= '' then table.insert(lines, 'Stripped current command line: ' .. prefix) end
-
+    local recent_output = recent_terminal_output_for(target, raw_line, prefix, config)
+    if recent_output ~= '' then table.insert(lines, 'Recent terminal output:\n' .. recent_output) end
     if #lines == 0 then return '' end
     return table.concat(lines, '\n')
 end
 
-local function provider_context_for(window, pane, selected_context)
+local function provider_context_for(window, pane, selected_context, config)
     local chunks = {}
     if selected_context and selected_context ~= '' then
         table.insert(chunks, 'Selected terminal text:\n' .. selected_context)
     end
 
-    local terminal_context = terminal_context_for(window, pane)
+    local terminal_context = terminal_context_for(window, pane, config)
     if terminal_context ~= '' then
         table.insert(chunks, 'Shell context:\n' .. terminal_context)
     end
@@ -900,7 +965,7 @@ process_prompt_with_context = function(user_prompt, selected_context, window, pa
     end
     local api_prompt = table.concat(prompt_lines, '\n')
 
-    api_prompt = with_context(api_prompt, provider_context_for(window, pane, selected_context))
+    api_prompt = with_context(api_prompt, provider_context_for(window, pane, selected_context, config))
 
     provider.call(config, config.system_prompt, api_prompt, function(response)
         -- Parse response into command + description pairs.
