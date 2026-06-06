@@ -102,6 +102,9 @@ return config
 1. Type the beginning of a shell command in your pane, e.g. `git che`
 2. Press `Ctrl+Shift+E`
 3. AI Commander appends only the missing suffix at the cursor
+4. Mid-line completions use right-of-cursor text as context and avoid duplicating it
+
+While completion is running, AI Commander adds a temporary right-status indicator next to your existing right status when WezTerm exposes it. Provider errors and timeouts show a short completion-specific failure status instead of inserting text.
 
 ### Streaming Ask
 
