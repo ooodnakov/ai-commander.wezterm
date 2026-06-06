@@ -670,7 +670,7 @@ local function terminal_context_for(window, pane)
 
     local cwd = current_working_dir_for(target)
     local process = foreground_process_for(target)
-    local prefix, raw_line = current_command_prefix(window, target)
+    local prefix, raw_line = current_command_context(window, target)
     local branch = git_branch_for(cwd)
     local lines = {}
 

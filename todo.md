@@ -2,25 +2,14 @@
 
 ## Chat pane
 
-- Add slash commands: `/clear`, `/context`, `/model`, `/provider`, `/save`, and `/copy`.
-- Make `Ctrl+C` cancel the active response while keeping the chat pane alive.
-- Show startup status: provider, model, renderer, selected-context size, and history message count.
-- Keep a per-chat transcript file that can be saved or reopened.
+- Add context-window safeguards: warn/truncate when selected text or history gets too large.
+- Add `/load` or equivalent flow to reopen saved chat transcripts.
 
-## Prompt and context UX
+## Command generation
 
-- Make prompt history editable before submit instead of immediately rerunning old prompts.
-- Add a separate repeat-last-prompt action for current selected context.
-- Add commands to refresh or drop selected-pane context inside chat.
-- Include useful shell context: current working directory, git branch, prompt line, and optionally recent terminal output.
+- Include recent terminal output as optional command-generation context.
 
-## Command handling
+## Chat command handling
 
 - Extract commands from chat responses and support `/insert N`, `/copy N`, and `/run N`.
-- Flag destructive commands and require confirmation before inserting or running them.
-- Keep generated command recall separate from chat transcript recall.
-
-## Diagnostics
-
-- Add `WEZTERM_AI_COMMANDER_DEBUG=1` to save request bodies, response events, renderer command, and history JSON.
-- Add provider/model health details to the existing check command.
+- Reuse destructive-command confirmation for chat command insert/run.
