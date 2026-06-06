@@ -48,6 +48,30 @@ local function send_text(window, pane, text)
     return true
 end
 
+local function inject_output(window, pane, text)
+    local target = active_pane_for(window, pane)
+    if not target or not target.inject_output then
+        if window and window.toast_notification then
+            pcall(function()
+                window:toast_notification('AI Commander', 'Output pane does not support inject_output', nil, 3000)
+            end)
+        end
+        wezterm.log_warn('ai-commander: unable to display output: pane does not support inject_output')
+        return false
+    end
+
+    local output = tostring(text or ''):gsub('\r\n', '\n'):gsub('\n', '\r\n')
+    local ok, err = pcall(function()
+        target:inject_output(output)
+    end)
+    if not ok then
+        wezterm.log_warn('ai-commander: unable to inject output into pane: ' .. tostring(err))
+        return false
+    end
+    return true
+end
+
+
 local function perform_action(window, pane, action)
     local target = active_pane_for(window, pane)
     if not window or not target then return false end
@@ -1290,7 +1314,7 @@ function M.check_provider(window, pane)
     local warnings = cfg.validate(config)
     local report = provider.check(config, warnings)
     if pane then
-        send_text(window, pane, '\n# AI Commander Provider Check\n' .. report.message .. '\n')
+        inject_output(window, pane, '\n# AI Commander Provider Check\n' .. report.message .. '\n')
     end
     return report
 end
@@ -1301,7 +1325,7 @@ function M.setup_backend(window, pane, opts)
     local config = cfg.get()
     local report = provider.setup_backend(config, opts or {})
     if pane then
-        send_text(window, pane, '\n# AI Commander Backend Setup\n' .. report.message .. '\n')
+        inject_output(window, pane, '\n# AI Commander Backend Setup\n' .. report.message .. '\n')
     end
     return report
 end
