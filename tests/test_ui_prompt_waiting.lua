@@ -7,6 +7,7 @@ local right_statuses = {}
 local provider_called_after_waiting = false
 local sent_text = ''
 local completion_prompt = nil
+local completion_mode = 'single'
 
 local function assert_truthy(value, label)
     if not value then error(label, 2) end
@@ -76,7 +77,11 @@ package.preload['provider'] = function()
         call = function(_, system, prompt, callback)
             if system:find('partially typed shell commands', 1, true) then
                 completion_prompt = prompt
-                callback(' status')
+                if completion_mode == 'multi' then
+                    callback(' --decorate')
+                else
+                    callback(' status')
+                end
                 return
             end
             provider_called_after_waiting = actions[#actions] and actions[#actions].title == 'AI Commander · Generating Commands'
@@ -111,6 +116,15 @@ local mux_pane = {
         assert_equal(start_y, 10, 'completion reads cursor row')
         assert_equal(end_y, 10, 'completion reads only cursor row')
         assert_truthy(end_x >= 1, 'completion uses cursor column')
+        if completion_mode == 'multi' then
+            return '> --oneline'
+        end
+        return '❯ git'
+    end,
+    get_lines_as_text = function()
+        if completion_mode == 'multi' then
+            return '❯ git log \\\n> --oneline'
+        end
         return '❯ git'
     end,
     get_current_working_dir = function()
@@ -177,8 +191,15 @@ window:set_right_status('normal status overwrite')
 event_handlers['update-status'](window, mux_pane)
 assert_truthy(right_statuses[#right_statuses]:find('AI completing command', 1, true), 'completion indicator survives status refresh')
 timers[2]()
-assert_truthy(completion_prompt:find('Editable command prefix:\ngit', 1, true), 'completion prompt strips shell prompt')
+assert_truthy(completion_prompt:find('Editable command prefix %(may be multiline%):\ngit'), 'completion prompt strips shell prompt')
 assert_equal(sent_text, 'printf okprintf nope status', 'completion appends only suffix')
 assert_truthy(right_statuses[#right_statuses]:find('AI completion inserted', 1, true), 'completion shows inserted indicator')
+
+completion_mode = 'multi'
+ui.complete_current_command(window, stale_pane)
+assert_equal(#timers, 3, 'multiline completion provider call is delayed')
+timers[3]()
+assert_truthy(completion_prompt:find('Editable command prefix %(may be multiline%):\ngit log \\\n%-%-oneline'), 'multiline completion includes prior command lines')
+assert_equal(sent_text, 'printf okprintf nope status --decorate', 'multiline completion appends suffix')
 
 print('ok')

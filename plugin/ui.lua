@@ -303,6 +303,101 @@ local function strip_common_prompt(line)
     return line:gsub('^%s+', '')
 end
 
+local function split_lines(text)
+    local lines = {}
+    local value = tostring(text or '')
+    for line in (value .. '\n'):gmatch('([^\n]*)\n') do
+        table.insert(lines, line)
+        if #lines > 200 then break end
+    end
+    if #lines > 0 and lines[#lines] == '' and value:sub(-1) ~= '\n' then
+        table.remove(lines)
+    end
+    return lines
+end
+
+local continuation_prompts = {
+    ['>'] = true,
+    quote = true,
+    dquote = true,
+    bquote = true,
+    cmdsubst = true,
+    heredoc = true,
+    ['for'] = true,
+    ['while'] = true,
+    ['until'] = true,
+    ['if'] = true,
+    ['then'] = true,
+    ['else'] = true,
+    ['case'] = true,
+    select = true,
+    ['function'] = true,
+    brace = true,
+    pipe = true,
+}
+
+local function is_continuation_prompt(line)
+    local prompt = tostring(line or ''):match('^%s*([%w_%-]*)>%s+')
+    if prompt == nil then return false end
+    if prompt == '' then return true end
+    prompt = prompt:gsub('%-', '_')
+    return continuation_prompts[prompt] or false
+end
+
+local function line_continues(stripped)
+    local value = tostring(stripped or ''):match('^%s*(.-)%s*$') or ''
+    return value:match('\\$')
+        or value:match('|$')
+        or value:match('&&$')
+        or value:match('%|%|$')
+        or value:match('%($')
+        or value:match('%{$')
+        or value:match('%[$')
+        or value:match('%f[%w]do$')
+        or value:match('%f[%w]then$')
+end
+
+local function multiline_command_prefix(target, current_raw, current_prefix)
+    local ok_recent, recent = pcall(function()
+        return target:get_lines_as_text(12)
+    end)
+    if not ok_recent or not recent or recent == '' then
+        return current_prefix, current_raw
+    end
+
+    local lines = split_lines(recent)
+    if current_raw and current_raw ~= '' then
+        if #lines == 0 or last_line(lines[#lines]) ~= last_line(current_raw) then
+            table.insert(lines, current_raw)
+        else
+            lines[#lines] = current_raw
+        end
+    end
+    if #lines == 0 then return current_prefix, current_raw end
+
+    local current_is_continuation = is_continuation_prompt(current_raw)
+    if not current_is_continuation then
+        local previous = lines[#lines - 1]
+        if not previous or not line_continues(strip_common_prompt(previous)) then
+            return current_prefix, current_raw
+        end
+    end
+
+    local collected = { current_prefix or '' }
+    for index = #lines - 1, 1, -1 do
+        local raw = lines[index]
+        local stripped = strip_common_prompt(raw)
+        if stripped == '' then break end
+        table.insert(collected, 1, stripped)
+        if not is_continuation_prompt(raw) then
+            break
+        end
+    end
+
+    return table.concat(collected, '\n'), table.concat(lines, '\n')
+end
+
+
 local function current_command_prefix(window, pane)
     local target = active_pane_for(window, pane)
     if not target then return nil, nil end
@@ -318,7 +413,8 @@ local function current_command_prefix(window, pane)
         end)
         if ok_region and text and text ~= '' then
             local raw = last_line(text)
-            return strip_common_prompt(raw), raw
+            local prefix = strip_common_prompt(raw)
+            return multiline_command_prefix(target, raw, prefix)
         end
     end
 
@@ -327,7 +423,8 @@ local function current_command_prefix(window, pane)
     end)
     if ok_line and text and text ~= '' then
         local raw = last_line(text)
-        return strip_common_prompt(raw), raw
+        local prefix = strip_common_prompt(raw)
+        return multiline_command_prefix(target, raw, prefix)
     end
 
     return nil, nil
@@ -352,9 +449,9 @@ local function sanitize_completion(response, prefix, raw_line)
 end
 
 local completion_system_prompt = table.concat({
-    'You complete partially typed shell commands.',
-    'Return only the exact suffix to append at the cursor.',
-    'Do not repeat existing text unless no shorter suffix is possible.',
+    'You complete partially typed shell commands, including multiline commands.',
+    'Return only the exact suffix to append at the cursor on the current line.',
+    'Use prior lines only as context; do not repeat existing lines unless no shorter suffix is possible.',
     'Do not include markdown, quotes, explanations, or trailing newline.',
     'Prefer safe, boring, idiomatic shell completions.',
     'If there is no useful safe completion, return an empty response.',
@@ -617,10 +714,10 @@ function M.complete_current_command(window, pane)
     if ok_process and process_value then process_name = tostring(process_value) end
 
     local prompt = table.concat({
-        'Current terminal line, including prompt if visible:',
+        'Current terminal command block, including prompt if visible:',
         raw_line or '',
         '',
-        'Editable command prefix:',
+        'Editable command prefix (may be multiline):',
         prefix,
         '',
         'Current working directory:',
@@ -629,7 +726,7 @@ function M.complete_current_command(window, pane)
         'Foreground process:',
         process_name,
         '',
-        'Return only the suffix to append to the editable command prefix.',
+        'Return only the suffix to append at the cursor on the current line.',
     }, '\n')
 
     local config = config_with_theme(cfg.get(), window)
