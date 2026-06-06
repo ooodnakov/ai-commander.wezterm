@@ -120,6 +120,7 @@ While completion is running, AI Commander adds a temporary right-status indicato
    - `/save` writes the current pane transcript to `~/.local/state/ai-commander/transcripts/` or `$XDG_STATE_HOME/ai-commander/transcripts/`
    - `/load`, `/load latest`, `/load list`, `/load N`, or `/load /path/to/chat.md` reopens saved transcripts
    - `/copy` copies the transcript with OSC 52 when the terminal supports it
+   - `/copy answer` (aliases: `/copy last`, `/copy assistant`, `/copy response`) copies the latest assistant answer as raw markdown, without Rich panel borders
    - `/copy N`, `/insert N`, and `/run N` act on commands extracted from the latest chat responses; dangerous insert/run actions require typed confirmation
 5. Press `Ctrl+C` while a response streams to cancel that response only; the chat pane stays open
 6. Type `/q`, `:q`, `q`, `quit`, or `exit` to close the chat pane

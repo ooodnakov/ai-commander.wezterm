@@ -306,6 +306,50 @@ def test_chat_extracts_commands_copy_insert_run_and_invalid_number():
     assert run_calls[1][1] == {"shell": True}
 
 
+def test_chat_copy_answer_prints_last_assistant_without_transcript_wrappers():
+    backend = load_backend()
+
+    class FakeResponse:
+        def iter_lines(self, **kwargs):
+            text = "Line one\n\nLine two with **markdown**"
+            yield ('data: {"type":"response.output_text.delta","delta":' + json.dumps(text) + '}').encode()
+
+    def fake_post(config, system, messages, *, stream, max_tokens):
+        return "openai", FakeResponse(), True
+
+    backend.post = fake_post
+    old_stdin = sys.stdin
+    config = {
+        "provider": "openai",
+        "renderer": "cat",
+        "chat_system_prompt": "sys",
+        "max_conversation_messages": 12,
+        "conversation_continuity": False,
+    }
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as config_file, tempfile.NamedTemporaryFile("w+", encoding="utf-8") as context_file:
+        json.dump(config, config_file)
+        config_file.flush()
+        context_file.flush()
+        args = type("Args", (), {"config": config_file.name, "context": context_file.name})()
+        sys.stdin = io.StringIO("first\n/copy answer\n/q\n")
+        stdout = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout):
+                assert backend.run_chat(args) == 0
+        finally:
+            sys.stdin = old_stdin
+
+    output = stdout.getvalue()
+    assert "Assistant response copy unsupported in this terminal/session. Copy manually:" in output
+    copied = output.split("Assistant response copy unsupported in this terminal/session. Copy manually:", 1)[1]
+    assert "Line one\n\nLine two with **markdown**" in copied
+    assert "ASSISTANT:" not in copied
+    assert "USER:" not in copied
+    assert "╭" not in copied
+    assert "│" not in copied
+    assert "╰" not in copied
+
+
 def test_chat_dangerous_insert_and_run_require_confirmation_and_cancel():
     backend = load_backend()
     run_calls = []

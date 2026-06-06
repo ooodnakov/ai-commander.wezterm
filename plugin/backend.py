@@ -1305,6 +1305,26 @@ def parse_command_number(command: str, name: str, commands: list[str]) -> tuple[
         return None, f"Invalid command number: {index}"
     return index, None
 
+def latest_assistant_content(transcript: list[dict[str, str]]) -> str:
+    for item in reversed(transcript):
+        if str(item.get("role") or "").lower() == "assistant":
+            content = str(item.get("content") or "")
+            if content:
+                return content
+    return ""
+
+
+def copy_latest_assistant(transcript: list[dict[str, str]]) -> None:
+    content = latest_assistant_content(transcript)
+    if not content:
+        print("No assistant response to copy yet.", flush=True)
+        return
+    if copy_text_osc52(content):
+        print("Last assistant response copied with OSC 52.", flush=True)
+    else:
+        print("Assistant response copy unsupported in this terminal/session. Copy manually:", flush=True)
+        print(content, flush=True)
+
 
 def copy_extracted_command(command: str) -> None:
     if copy_text_osc52(command):
@@ -1538,15 +1558,20 @@ def handle_chat_command(
         history, transcript = handle_load_command(command, config, history, transcript)
         return True, history, transcript, pending_confirmation
     if name == "/copy":
-        if command.strip() == "/copy":
+        parts = command.strip().split(maxsplit=1)
+        if len(parts) == 1:
             if copy_transcript_osc52(transcript):
                 print("Transcript copied with OSC 52.", flush=True)
             else:
                 print("Transcript copy unsupported in this terminal/session; use /save instead.", flush=True)
             return True, history, transcript, pending_confirmation
+        copy_arg = parts[1].strip().lower()
+        if copy_arg in ("last", "answer", "assistant", "response"):
+            copy_latest_assistant(transcript)
+            return True, history, transcript, pending_confirmation
         index, error = parse_command_number(command, "/copy", commands)
         if error:
-            print(error, flush=True)
+            print("Usage: /copy, /copy answer, or /copy N", flush=True)
             return True, history, transcript, pending_confirmation
         copy_extracted_command(commands[index - 1])
         return True, history, transcript, pending_confirmation
