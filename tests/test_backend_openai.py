@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -138,6 +139,118 @@ def test_chat_prints_header_ignores_blank_and_keeps_history():
     assert calls[1][2] == {"role": "user", "content": "second\n\nContext:\nctx"}
 
 
+def test_chat_slash_commands_save_copy_and_clear_without_leaking_tokens():
+    backend = load_backend()
+    calls = []
+
+    class FakeResponse:
+        def iter_lines(self, **kwargs):
+            yield b'data: {"type":"response.output_text.delta","delta":"answer"}'
+
+    def fake_post(config, system, messages, *, stream, max_tokens):
+        calls.append(messages)
+        return "openai", FakeResponse(), True
+
+    backend.post = fake_post
+    old_env = dict(os.environ)
+    old_stdin = sys.stdin
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "conversation.json"
+        config = {
+            "provider": "openai",
+            "renderer": "cat",
+            "chat_system_prompt": "sys",
+            "model": {"openai": "gpt-test"},
+            "api_key": {"openai": "secret-token"},
+            "api_url": {"openai": "https://api.example.test/responses"},
+            "max_conversation_messages": 12,
+            "conversation_continuity": True,
+            "conversation_state_file": str(state_path),
+        }
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as config_file, tempfile.NamedTemporaryFile("w+", encoding="utf-8") as context_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            context_file.write("selected context line")
+            context_file.flush()
+            args = type("Args", (), {"config": config_file.name, "context": context_file.name})()
+            os.environ["XDG_STATE_HOME"] = tmp
+            sys.stdin = io.StringIO("/model\n/provider\n/context\nfirst\n/save\n/copy\n/clear\n/q\n")
+            stdout = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(stdout):
+                    assert backend.run_chat(args) == 0
+            finally:
+                sys.stdin = old_stdin
+                os.environ.clear()
+                os.environ.update(old_env)
+
+        output = stdout.getvalue()
+        assert "Model: gpt-test" in output
+        assert "Provider: openai, endpoint https://api.example.test/responses, auth api_key" in output
+        assert "secret-token" not in output
+        assert "Context: selected" in output
+        assert "Preview: selected context line" in output
+        assert "Transcript saved:" in output
+        assert "Transcript copy unsupported" in output
+        assert "Chat history cleared." in output
+        saved = sorted((Path(tmp) / "ai-commander" / "transcripts").glob("chat-*.md"))
+        assert len(saved) == 1
+        assert "USER:\nfirst" in saved[0].read_text(encoding="utf-8")
+        assert json.loads(state_path.read_text(encoding="utf-8")) == {"messages": []}
+    assert len(calls) == 1
+
+
+def test_chat_ctrl_c_cancels_response_and_keeps_loop_alive():
+    backend = load_backend()
+    calls = []
+    stream_calls = 0
+
+    class FakeResponse:
+        pass
+
+    def fake_post(config, system, messages, *, stream, max_tokens):
+        calls.append(messages)
+        return "openai", FakeResponse(), True
+
+    def fake_iter_stream_deltas(response, provider):
+        nonlocal stream_calls
+        stream_calls += 1
+        if stream_calls == 1:
+            raise KeyboardInterrupt
+        yield "second answer"
+
+    backend.post = fake_post
+    backend.iter_stream_deltas = fake_iter_stream_deltas
+    config = {
+        "provider": "openai",
+        "renderer": "cat",
+        "chat_system_prompt": "sys",
+        "max_conversation_messages": 12,
+        "conversation_continuity": False,
+    }
+
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as config_file, tempfile.NamedTemporaryFile("w+", encoding="utf-8") as context_file:
+        json.dump(config, config_file)
+        config_file.flush()
+        context_file.flush()
+        args = type("Args", (), {"config": config_file.name, "context": context_file.name})()
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO("first\nsecond\n/q\n")
+        stdout = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout):
+                assert backend.run_chat(args) == 0
+        finally:
+            sys.stdin = old_stdin
+
+    output = stdout.getvalue()
+    assert "AI response cancelled" in output
+    assert "Chat remains open." in output
+    assert "second answer" in output
+    assert len(calls) == 2
+    assert calls[1] == [{"role": "user", "content": "second"}]
+
+
 def test_rich_renderer_uses_live_markdown_updates():
     backend = load_backend()
     assert backend.rich_available()
@@ -164,5 +277,7 @@ if __name__ == "__main__":
     test_codex_subscription_request_body_omits_public_api_fields()
     test_openai_sse_parser_yields_text_deltas_only()
     test_chat_prints_header_ignores_blank_and_keeps_history()
+    test_chat_slash_commands_save_copy_and_clear_without_leaking_tokens()
+    test_chat_ctrl_c_cancels_response_and_keeps_loop_alive()
     test_rich_renderer_uses_live_markdown_updates()
     print("ok")

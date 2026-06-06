@@ -105,7 +105,15 @@ return config
 1. Press `Ctrl+Shift+A` to open an interactive bottom split
 2. Type questions at the `Ask AI>` prompt; responses render incrementally with Python Rich markdown
 3. Follow-up questions in the same chat pane include prior turns as context
-4. Type `/q`, `:q`, `q`, `quit`, or `exit` to close the chat pane
+4. Use slash commands inside the pane:
+   - `/clear` clears in-pane history and the persisted conversation file when continuity is enabled
+   - `/context` prints selected-context size and preview
+   - `/model` prints the active provider model
+   - `/provider` prints provider, endpoint, and auth type without token values
+   - `/save` writes the current pane transcript to `~/.local/state/ai-commander/transcripts/` or `$XDG_STATE_HOME/ai-commander/transcripts/`
+   - `/copy` copies the transcript with OSC 52 when the terminal supports it; otherwise it prints an unsupported message and keeps the pane open
+5. Press `Ctrl+C` while a response streams to cancel that response only; the chat pane stays open
+6. Type `/q`, `:q`, `q`, `quit`, or `exit` to close the chat pane
 
 Rich uses `rich.live.Live(Panel(Markdown(buffer)), refresh_per_second=12, screen=false)` to update a bordered AI response panel in place while tokens arrive, avoiding Glow-style scrollback rewrite hacks. Set `renderer = "streamdown"` for an external streaming renderer, or `renderer = "cat"` for plain text.
 
@@ -259,7 +267,7 @@ ai.apply_to_config(config, {
 })
 ```
 
-The plugin stores a compact local message history for both OpenAI and Anthropic ask mode. This avoids unsupported subscription parameters such as `previous_response_id` and keeps the same behavior across providers.
+The plugin stores a compact local message history for both OpenAI and Anthropic ask mode. This avoids unsupported subscription parameters such as `previous_response_id` and keeps the same behavior across providers. Full chat transcripts stay in memory unless you call `/save`.
 
 ### Config Validation
 
