@@ -59,6 +59,26 @@ local function renderer_command(renderer)
     return tostring(renderer):match('^(%S+)')
 end
 
+local function default_state_dir()
+    local explicit = os.getenv('WEZTERM_AI_COMMANDER_STATE_DIR')
+    if explicit and explicit ~= '' then return explicit end
+    local xdg = os.getenv('XDG_STATE_HOME')
+    if xdg and xdg ~= '' then return xdg .. '/ai-commander.wezterm' end
+    if wezterm.home_dir then return wezterm.home_dir .. '/.local/state/ai-commander.wezterm' end
+    return '.'
+end
+
+local function default_venv_path()
+    if wezterm.home_dir then return wezterm.home_dir .. '/.local/share/ai-commander.wezterm/venv' end
+    return './venv'
+end
+
+local function debug_dir()
+    local explicit = os.getenv('WEZTERM_AI_COMMANDER_DEBUG_DIR')
+    if explicit and explicit ~= '' then return explicit end
+    return default_state_dir() .. '/debug'
+end
+
 local function readable(path)
     local file = io.open(path, 'r')
     if not file then return false end
@@ -113,9 +133,7 @@ local function default_backend_python_candidates(config)
         table.insert(candidates, env_python)
     end
 
-    if wezterm.home_dir then
-        table.insert(candidates, wezterm.home_dir .. '/.local/share/ai-commander.wezterm/venv/bin/python')
-    end
+    table.insert(candidates, default_venv_path() .. '/bin/python')
 
     table.insert(candidates, 'python')
     table.insert(candidates, 'python3')
@@ -226,6 +244,32 @@ function M.call(config, system_message, user_message, callback, opts)
 end
 
 
+function M.setup_backend(config, opts)
+    local python = (config and config.setup_python and tostring(config.setup_python)) or 'python3'
+    local backend = backend_path()
+    if not file_exists(backend) then
+        return {
+            ok = false,
+            message = 'Python backend not found: ' .. backend,
+        }
+    end
+
+    local args = { python, backend, 'setup', '--venv', default_venv_path() }
+    if opts and opts.no_install then table.insert(args, '--no-install') end
+    if opts and opts.recreate then table.insert(args, '--recreate') end
+    local child_ok, success, stdout, stderr = pcall(wezterm.run_child_process, args)
+    local output = table.concat({ stdout or '', stderr or '' }, '\n')
+    if not child_ok then
+        return { ok = false, message = 'Backend setup could not start: ' .. tostring(success) }
+    end
+    return {
+        ok = success and true or false,
+        message = output ~= '' and output or 'backend setup produced no output',
+        command = table.concat(args, ' '),
+    }
+end
+
+
 function M.check(config, validation_warnings)
     local name = config.provider or 'anthropic'
     local lines = {}
@@ -237,6 +281,14 @@ function M.check(config, validation_warnings)
     end
 
     add('ℹ️', 'Provider: ' .. name)
+    local model = config.model and config.model[name] or nil
+    local auth_mode = config.auth_type and config.auth_type[name] or 'api_key'
+    add('ℹ️', 'Model: ' .. tostring(model or '(unset)'))
+    add('ℹ️', 'Token limits: max=' .. tostring(config.max_tokens or '(unset)') .. ', chat=' .. tostring(config.chat_max_tokens or '(unset)'))
+    add('ℹ️', 'Configured auth mode: ' .. tostring(auth_mode))
+    if os.getenv('WEZTERM_AI_COMMANDER_DEBUG') == '1' then
+        add('ℹ️', 'Debug dir: ' .. debug_dir())
+    end
 
     for _, warning in ipairs(validation_warnings or {}) do
         add('⚠️', warning)
@@ -274,12 +326,12 @@ function M.check(config, validation_warnings)
 
             local output = table.concat({ stdout or '', stderr or '' }, '\n')
             if child_ok and success then
-                add('✅', 'Backend check passed (provider auth, requests, rich, config)')
+                add('✅', 'Backend check passed')
                 if not append_output_lines(add, 'ℹ️', 'backend: ', output) then
                     add('ℹ️', 'backend: no diagnostic output')
                 end
             elseif child_ok then
-                add('❌', 'Backend check failed (provider auth, requests, rich, config)')
+                add('❌', 'Backend check failed')
                 if not append_output_lines(add, 'ℹ️', 'backend: ', output) then
                     add('ℹ️', 'backend: no diagnostic output')
                 end

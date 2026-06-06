@@ -93,5 +93,10 @@ function M.check_provider(window, pane)
     return ui.check_provider(window, pane)
 end
 
+-- Explicitly create/repair backend venv; never runs during config load
+function M.setup_backend(window, pane, opts)
+    return ui.setup_backend(window, pane, opts)
+end
+
 
 return M

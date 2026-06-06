@@ -860,4 +860,15 @@ function M.check_provider(window, pane)
     return report
 end
 
+
+-- Explicitly create/repair Python backend venv. Never called during config load.
+function M.setup_backend(window, pane, opts)
+    local config = cfg.get()
+    local report = provider.setup_backend(config, opts or {})
+    if pane then
+        send_text(window, pane, '\n# AI Commander Backend Setup\n' .. report.message .. '\n')
+    end
+    return report
+end
+
 return M

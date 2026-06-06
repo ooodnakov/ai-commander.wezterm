@@ -4,17 +4,25 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
 import subprocess
 import sys
+import time
+import venv
 from pathlib import Path
 from typing import Any, Iterable
 
-import requests
+try:
+    import requests
+except ImportError:  # explicit setup/doctor must work before deps are installed
+    requests = None
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -54,6 +62,112 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 class BackendError(Exception):
     pass
+
+
+DEBUG_COUNTER = 0
+SENSITIVE_KEY_RE = re.compile(
+    r"(authorization|api[_-]?key|access[_-]?token|auth[_-]?token|bearer|password|secret|credential)",
+    re.I,
+)
+SECRET_VALUE_RE = re.compile(
+    r"(Bearer\s+)[A-Za-z0-9._~+/=-]+|"
+    r"(sk-[A-Za-z0-9._-]+)|"
+    r"(sk-ant-[A-Za-z0-9._-]+)|"
+    r"([A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,})"
+)
+
+
+def debug_enabled() -> bool:
+    return os.getenv("WEZTERM_AI_COMMANDER_DEBUG") == "1"
+
+
+def user_state_dir() -> Path:
+    explicit = os.getenv("WEZTERM_AI_COMMANDER_STATE_DIR")
+    if is_non_empty(explicit):
+        return Path(expand_path(explicit) or explicit)
+    xdg_state = os.getenv("XDG_STATE_HOME")
+    if is_non_empty(xdg_state):
+        return Path(expand_path(xdg_state) or xdg_state) / "ai-commander.wezterm"
+    return Path.home() / ".local" / "state" / "ai-commander.wezterm"
+
+
+def debug_dir() -> Path:
+    explicit = os.getenv("WEZTERM_AI_COMMANDER_DEBUG_DIR")
+    if is_non_empty(explicit):
+        return Path(expand_path(explicit) or explicit)
+    return user_state_dir() / "debug"
+
+
+def debug_location() -> str:
+    return str(debug_dir())
+
+
+def redact_text(value: str) -> str:
+    return SECRET_VALUE_RE.sub(
+        lambda match: (match.group(1) + "<redacted>") if match.group(1) else "<redacted>",
+        value,
+    )
+
+
+def redact(value: Any, key: str = "") -> Any:
+    if SENSITIVE_KEY_RE.search(key):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {str(k): redact(v, str(k)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact(item, key) for item in value]
+    if isinstance(value, str):
+        return redact_text(value)
+    return value
+
+
+def summarize_message(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return {"type": type(item).__name__}
+    content = item.get("content")
+    text = json.dumps(content, ensure_ascii=False, sort_keys=True) if not isinstance(content, str) else content
+    return {
+        "role": item.get("role"),
+        "content_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "content_bytes": len(text.encode("utf-8")),
+    }
+
+
+def summarize_history(history: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "message_count": len(history),
+        "messages": [summarize_message(item) for item in history],
+    }
+
+
+def write_debug_json(kind: str, payload: Any) -> str | None:
+    if not debug_enabled():
+        return None
+    global DEBUG_COUNTER
+    DEBUG_COUNTER += 1
+    directory = debug_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{DEBUG_COUNTER:04d}-{kind}.json"
+    path.write_text(
+        json.dumps(redact(payload), ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def write_backend_metadata(mode: str, args: argparse.Namespace | None = None) -> str | None:
+    payload = {
+        "mode": mode,
+        "argv": sys.argv,
+        "cwd": os.getcwd(),
+        "python": sys.executable,
+        "prefix": sys.prefix,
+        "base_prefix": getattr(sys, "base_prefix", sys.prefix),
+        "backend": str(Path(__file__).resolve()),
+    }
+    if args is not None:
+        payload["args"] = vars(args)
+    return write_debug_json("backend_command", payload)
 
 
 def is_non_empty(value: Any) -> bool:
@@ -501,9 +615,15 @@ def extract_response(provider: str, response: Any) -> str:
     raise BackendError("Error: No content found in Anthropic Messages API response")
 
 
-def parse_sse_lines(lines: Iterable[bytes], provider: str) -> Iterable[str]:
+def parse_sse_lines(
+    lines: Iterable[bytes],
+    provider: str,
+    debug_stream: dict[str, Any] | None = None,
+) -> Iterable[str]:
     for raw in lines:
         line = raw.decode("utf-8", errors="replace").strip()
+        if debug_stream is not None:
+            debug_stream.setdefault("sse_lines", []).append(line)
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
@@ -512,7 +632,11 @@ def parse_sse_lines(lines: Iterable[bytes], provider: str) -> Iterable[str]:
         try:
             event = json.loads(payload)
         except json.JSONDecodeError:
+            if debug_stream is not None:
+                debug_stream.setdefault("invalid_events", []).append(payload)
             continue
+        if debug_stream is not None:
+            debug_stream.setdefault("events", []).append(event)
         if provider == "openai":
             if event.get("type") == "response.output_text.delta" and isinstance(event.get("delta"), str):
                 yield event["delta"]
@@ -527,8 +651,17 @@ def parse_sse_lines(lines: Iterable[bytes], provider: str) -> Iterable[str]:
                 yield delta["text"]
 
 
-def iter_stream_deltas(response: requests.Response, provider: str) -> Iterable[str]:
-    return parse_sse_lines(response.iter_lines(chunk_size=1), provider)
+def iter_stream_deltas(response: Any, provider: str) -> Iterable[str]:
+    debug_stream = {"provider": provider} if debug_enabled() else None
+    try:
+        yield from parse_sse_lines(
+            response.iter_lines(chunk_size=1),
+            provider,
+            debug_stream,
+        )
+    finally:
+        if debug_stream is not None:
+            write_debug_json("response_stream", debug_stream)
 
 
 def resolve_command_path(command: str) -> str | None:
@@ -582,6 +715,9 @@ class DeltaWriter:
         self.box = None
         self.palette = theme_palette(theme)
         command = str(renderer or "").strip()
+        self.command = command
+        self.resolved_argv: list[str] | None = None
+        self.bytes_written = 0
         if not command or command == "cat":
             return
         try:
@@ -633,6 +769,7 @@ class DeltaWriter:
             self._warn(f"renderer command not found: {argv[0]}; using raw markdown")
             return
         try:
+            self.resolved_argv = resolved
             self.process = subprocess.Popen(resolved, stdin=subprocess.PIPE, text=True)
             self.raw = False
         except OSError as exc:
@@ -672,7 +809,24 @@ class DeltaWriter:
             return
         self.live.update(self._rich_renderable(), refresh=True)
 
+    def _debug_state(self, phase: str) -> None:
+        write_debug_json(
+            "renderer_state",
+            {
+                "phase": phase,
+                "renderer": self.command,
+                "resolved_argv": self.resolved_argv,
+                "raw": self.raw,
+                "rich": self.rich,
+                "warned": self.warned,
+                "buffer_bytes": len(self.buffer.encode("utf-8")),
+                "bytes_written": self.bytes_written,
+                "has_process": self.process is not None,
+            },
+        )
+
     def write(self, text: str) -> None:
+        self.bytes_written += len(text.encode("utf-8"))
         if self.rich:
             self.buffer += text
             self._render_rich()
@@ -688,22 +842,25 @@ class DeltaWriter:
             print(text, end="", flush=True)
 
     def close(self) -> None:
-        if self.rich:
-            self._render_rich()
-            if self.live is not None:
-                self.live.stop()
-            return
-        if self.process is None:
-            return
-        if self.process.stdin is not None:
-            try:
-                self.process.stdin.close()
-            except OSError:
-                pass
         try:
-            self.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
+            if self.rich:
+                self._render_rich()
+                if self.live is not None:
+                    self.live.stop()
+                return
+            if self.process is None:
+                return
+            if self.process.stdin is not None:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+        finally:
+            self._debug_state("close")
 def post(
     config: dict[str, Any],
     system: str,
@@ -712,6 +869,10 @@ def post(
     stream: bool,
     max_tokens: int,
 ):
+    if requests is None:
+        raise BackendError(
+            "Python dependency 'requests' is not installed. Run backend.py setup explicitly."
+        )
     provider = provider_name(config)
     credential = resolve_auth(config, provider)
     api_url = resolve_endpoint(config, provider, credential)
@@ -722,18 +883,43 @@ def post(
     if codex_stream:
         body = prepare_codex_body(body)
     request_stream = stream or codex_stream
+    headers = headers_for(provider, credential)
+    request_debug_path = write_debug_json(
+        "request",
+        {
+            "provider": provider,
+            "model": body.get("model"),
+            "endpoint": api_url,
+            "auth_type": credential.get("type"),
+            "auth_source": credential.get("source"),
+            "stream": request_stream,
+            "headers": headers,
+            "body": body,
+        },
+    )
     try:
         response = requests.post(
             api_url,
-            headers=headers_for(provider, credential),
+            headers=headers,
             json=body,
             stream=request_stream,
             timeout=(10, 120),
         )
         response.raise_for_status()
+        write_debug_json(
+            "response_metadata",
+            {
+                "provider": provider,
+                "status_code": getattr(response, "status_code", None),
+                "headers": dict(getattr(response, "headers", {}) or {}),
+                "request_debug": request_debug_path,
+                "stream": request_stream,
+            },
+        )
         return provider, response, request_stream
     except requests.RequestException as exc:
-        raise BackendError(f"HTTP request failed: {exc}") from exc
+        suffix = f" Debug files: {debug_location()}" if debug_enabled() else ""
+        raise BackendError(f"HTTP request failed: {exc}.{suffix}") from exc
 
 
 def run_generate(args: argparse.Namespace) -> int:
@@ -753,9 +939,14 @@ def run_generate(args: argparse.Namespace) -> int:
     try:
         payload = response.json()
     except ValueError as exc:
+        write_debug_json(
+            "response_text",
+            {"provider": provider, "text": getattr(response, "text", "")},
+        )
         raise BackendError(
             f"Failed to parse API response: {response.text[:1500]}"
         ) from exc
+    write_debug_json("response_body", {"provider": provider, "body": payload})
     print(extract_response(provider, payload), end="")
     return 0
 
@@ -771,31 +962,45 @@ def trim_history(history: list[dict[str, str]], limit: Any) -> list[dict[str, st
 
 
 def load_history(config: dict[str, Any]) -> list[dict[str, str]]:
-    if not config.get("conversation_continuity"):
-        return []
     path = config.get("conversation_state_file")
+    if not config.get("conversation_continuity"):
+        write_debug_json("history_load", {"enabled": False, "path": path})
+        return []
     state = read_optional_json(path)
+    history: list[dict[str, str]] = []
     if isinstance(state, list):
-        return [
+        history = [
             item
             for item in state
             if isinstance(item, dict) and item.get("role") in ("user", "assistant")
         ]
-    if isinstance(state, dict) and isinstance(state.get("messages"), list):
-        return [
+    elif isinstance(state, dict) and isinstance(state.get("messages"), list):
+        history = [
             item
             for item in state["messages"]
             if isinstance(item, dict) and item.get("role") in ("user", "assistant")
         ]
-    return []
+    write_debug_json(
+        "history_load",
+        {"enabled": True, "path": path, "snapshot": summarize_history(history)},
+    )
+    return history
 
 
 def save_history(config: dict[str, Any], history: list[dict[str, str]]) -> None:
-    if not config.get("conversation_continuity"):
-        return
     path = expand_path(config.get("conversation_state_file"))
+    if not config.get("conversation_continuity"):
+        write_debug_json(
+            "history_save",
+            {"enabled": False, "path": path, "snapshot": summarize_history(history)},
+        )
+        return
     if not path:
         return
+    write_debug_json(
+        "history_save",
+        {"enabled": True, "path": path, "snapshot": summarize_history(history)},
+    )
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
@@ -1045,6 +1250,53 @@ def command_available(command: str) -> bool:
     return which(argv[0]) is not None
 
 
+def package_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def default_venv_path() -> Path:
+    return Path.home() / ".local" / "share" / "ai-commander.wezterm" / "venv"
+
+
+def venv_python_path(venv_path: Path) -> Path:
+    return venv_path / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def backend_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def default_requirements_path() -> Path:
+    return backend_root() / "requirements.txt"
+
+
+def dependency_summary() -> dict[str, str]:
+    return {
+        "python": sys.version.split()[0],
+        "requests": package_version("requests"),
+        "rich": package_version("rich"),
+    }
+
+
+def renderer_summary(renderer: Any) -> str:
+    value = str(renderer or "cat").strip()
+    if not value or value == "cat":
+        return "cat/raw markdown"
+    if value == "rich":
+        return f"rich ({'available' if rich_available() else 'not installed'})"
+    try:
+        argv = shlex.split(value)
+    except ValueError:
+        return f"{value} (not parseable)"
+    if not argv:
+        return "cat/raw markdown"
+    resolved = resolve_renderer_argv(argv)
+    return f"{value} ({resolved[0] if resolved else 'not found'})"
+
+
 def validate_config(config: dict[str, Any]) -> list[str]:
     warnings: list[str] = []
     provider = config.get("provider") or "anthropic"
@@ -1066,45 +1318,91 @@ def validate_config(config: dict[str, Any]) -> list[str]:
 
 def run_check(args: argparse.Namespace) -> int:
     ok = True
+    config: dict[str, Any] = DEFAULT_CONFIG
+    provider = DEFAULT_CONFIG["provider"]
     try:
         config = load_config(args.config)
-        provider = config.get("provider") or "anthropic"
+        provider = provider_name(config)
+        model = model_for(config, provider)
+        auth_mode = (config.get("auth_type") or {}).get(provider) or "api_key"
         print(f"INFO provider: {provider}")
+        print(f"INFO model: {model or '(unset)'}")
+        print(f"INFO tokens: max={config.get('max_tokens')} chat={config.get('chat_max_tokens')}")
+        print(f"INFO configured auth mode: {auth_mode}")
         for warning in validate_config(config):
             print(f"WARN config: {warning}")
         credential = resolve_auth(config, provider)
         endpoint = resolve_endpoint(config, provider, credential)
-        print(f"OK auth: credentials resolved with {credential['type']} auth")
+        source = credential.get("source") or "unknown source"
+        print(f"OK auth: {credential['type']} credentials resolved ({source})")
         print(f"INFO endpoint: {endpoint}")
     except BackendError as exc:
         ok = False
         print(f"FAIL auth: {exc}")
-        config = DEFAULT_CONFIG
-    print("OK backend: python requests backend available")
-    renderer = str(config.get("renderer") or "")
-    if not renderer or renderer == "cat":
-        print("OK renderer: raw markdown")
-    elif renderer == "rich":
-        if rich_available():
-            print("OK renderer: rich")
-        else:
-            ok = False
-            print("FAIL renderer: rich package is not installed")
-    elif renderer == "streamdown":
-        if command_available(renderer):
-            print("OK renderer: streamdown")
-        else:
-            print(
-                "INFO renderer: optional renderer not found: streamdown; raw markdown fallback will be used"
-            )
-    elif command_available(renderer):
-        print(f"OK renderer: {renderer}")
+    versions = dependency_summary()
+    print(f"INFO python: {versions['python']} ({sys.executable})")
+    print(f"INFO venv: prefix={sys.prefix} base={getattr(sys, 'base_prefix', sys.prefix)}")
+    print(f"INFO expected venv: {default_venv_path()}")
+    print(f"INFO backend: {Path(__file__).resolve()}")
+    if requests is None:
+        ok = False
+        print("FAIL dependency: requests not installed")
     else:
-        print(
-            f"WARN renderer: not found: {renderer}; raw markdown fallback will be used"
-        )
+        print(f"OK dependency: requests {versions['requests']}")
+    if versions["rich"] == "not installed":
+        print("WARN dependency: rich not installed")
+    else:
+        print(f"OK dependency: rich {versions['rich']}")
+    print(f"INFO renderer: {renderer_summary(config.get('renderer'))}")
+    renderer = str(config.get("renderer") or "")
+    if renderer == "rich" and not rich_available():
+        ok = False
+        print("FAIL renderer: rich package is not installed")
+    elif renderer and renderer not in ("cat", "rich", "streamdown") and not command_available(renderer):
+        print(f"WARN renderer: not found: {renderer}; raw markdown fallback will be used")
+    if debug_enabled():
+        print(f"INFO debug_dir: {debug_location()}")
     return 0 if ok else 1
 
+
+
+def run_setup(args: argparse.Namespace) -> int:
+    venv_path = Path(expand_path(args.venv) or args.venv)
+    requirements = Path(expand_path(args.requirements) or args.requirements)
+    python_path = venv_python_path(venv_path)
+    print(f"INFO venv: {venv_path}")
+    if args.recreate or not python_path.exists():
+        print("INFO setup: creating virtualenv")
+        venv.EnvBuilder(with_pip=True, clear=bool(args.recreate)).create(venv_path)
+    else:
+        print("OK setup: virtualenv already exists")
+    if not python_path.exists():
+        raise BackendError(f"Python was not created at {python_path}")
+    print(f"OK setup: interpreter {python_path}")
+    if args.no_install:
+        print("INFO setup: dependency install skipped by --no-install")
+        return 0
+    if not requirements.exists():
+        raise BackendError(f"Requirements file not found: {requirements}")
+    command = [str(python_path), "-m", "pip", "install", "-r", str(requirements)]
+    print(f"INFO setup: installing dependencies from {requirements}")
+    completed = subprocess.run(command, text=True)
+    if completed.returncode != 0:
+        raise BackendError(f"pip install failed with exit code {completed.returncode}")
+    print("OK setup: dependencies installed")
+    return 0
+
+
+def run_doctor(args: argparse.Namespace) -> int:
+    venv_path = Path(expand_path(args.venv) or args.venv)
+    python_path = venv_python_path(venv_path)
+    print(f"INFO expected venv: {venv_path}")
+    if python_path.exists():
+        print(f"OK expected interpreter: {python_path}")
+    else:
+        print(f"FAIL expected interpreter missing: {python_path}")
+        return 1
+    return run_check(args)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ai-commander Python backend")
@@ -1122,6 +1420,16 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check")
     check.add_argument("--config", required=True)
     check.set_defaults(func=run_check)
+    setup = sub.add_parser("setup")
+    setup.add_argument("--venv", default=str(default_venv_path()))
+    setup.add_argument("--requirements", default=str(default_requirements_path()))
+    setup.add_argument("--no-install", action="store_true")
+    setup.add_argument("--recreate", action="store_true")
+    setup.set_defaults(func=run_setup)
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--config", required=True)
+    doctor.add_argument("--venv", default=str(default_venv_path()))
+    doctor.set_defaults(func=run_doctor)
     return parser
 
 
@@ -1129,9 +1437,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        write_backend_metadata(getattr(args, "mode", "unknown"), args)
         return args.func(args)
     except BackendError as exc:
-        print(str(exc), file=sys.stderr)
+        suffix = f"\nDebug files: {debug_location()}" if debug_enabled() else ""
+        print(str(exc) + suffix, file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130
