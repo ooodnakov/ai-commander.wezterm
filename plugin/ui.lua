@@ -215,6 +215,63 @@ end
 
 local completion_status = nil
 local completion_status_registered = false
+local completion_last_rendered = setmetatable({}, { __mode = 'k' })
+local completion_base_status = setmetatable({}, { __mode = 'k' })
+
+local function read_right_status(window)
+    if not window then return nil end
+
+    local ok, value = pcall(function()
+        if type(window.get_right_status) == 'function' then
+            return window:get_right_status()
+        end
+    end)
+    if ok and type(value) == 'string' then return value end
+
+    ok, value = pcall(function()
+        return window.right_status
+    end)
+    if ok and type(value) == 'string' then return value end
+
+    return nil
+end
+
+local function remember_base_status(window)
+    local current = read_right_status(window)
+    if current == nil then return end
+
+    local last_rendered = completion_last_rendered[window]
+    if current ~= last_rendered then
+        completion_base_status[window] = current
+    end
+end
+
+local function compose_completion_status(window, parts)
+    local base = completion_base_status[window]
+    if not base or base == '' then return parts end
+
+    local composed = {}
+    for _, part in ipairs(parts) do composed[#composed + 1] = part end
+    composed[#composed + 1] = { Foreground = { AnsiColor = 'Silver' } }
+    composed[#composed + 1] = { Text = '  │  ' }
+    composed[#composed + 1] = 'ResetAttributes'
+    composed[#composed + 1] = { Text = base }
+    return composed
+end
+
+local function restore_completion_base_status(window)
+    local base = completion_base_status[window]
+    if window and base and completion_last_rendered[window] then
+        pcall(function()
+            window:set_right_status(base)
+        end)
+    end
+    if window then
+        completion_last_rendered[window] = nil
+        completion_base_status[window] = nil
+    end
+end
+
 
 local function completion_status_ttl(state)
     if state == 'working' then return 120 end
@@ -239,12 +296,20 @@ local function completion_indicator_parts(status)
 end
 
 local function render_completion_indicator(window)
-    local parts = completion_indicator_parts(completion_status)
-    if not parts or not window then return false end
+    if not window then return false end
+    remember_base_status(window)
 
+    local parts = completion_indicator_parts(completion_status)
+    if not parts then
+        restore_completion_base_status(window)
+        return false
+    end
+
+    local rendered = formatted(compose_completion_status(window, parts))
     local ok = pcall(function()
-        window:set_right_status(formatted(parts))
+        window:set_right_status(rendered)
     end)
+    if ok then completion_last_rendered[window] = rendered end
     return ok
 end
 
@@ -254,17 +319,28 @@ function M.setup_completion_indicator()
 
     if not wezterm.on then return end
     wezterm.on('update-status', function(window)
-        render_completion_indicator(window)
+        if wezterm.time and wezterm.time.call_after then
+            wezterm.time.call_after(0, function()
+                render_completion_indicator(window)
+            end)
+        else
+            render_completion_indicator(window)
+        end
     end)
 end
 
 local function set_completion_indicator(window, state, prefix)
     if not window then return end
 
-    local icon = state == 'done' and '✓' or (state == 'empty' and '∅' or '󰚩')
-    local color = state == 'done' and 'Green' or (state == 'empty' and 'Yellow' or 'Aqua')
+    local icon = state == 'done' and '✓'
+        or (state == 'empty' and '∅')
+        or (state == 'error' and '✗' or '󰚩')
+    local color = state == 'done' and 'Green'
+        or (state == 'empty' and 'Yellow')
+        or (state == 'error' and 'Red' or 'Aqua')
     local label = state == 'done' and 'AI completion inserted'
-        or (state == 'empty' and 'AI found no completion' or 'AI completing command…')
+        or (state == 'empty' and 'AI found no completion')
+        or (state == 'error' and 'AI completion failed' or 'AI completing command…')
 
     completion_status = {
         icon = icon,
@@ -398,9 +474,55 @@ local function multiline_command_prefix(target, current_raw, current_prefix)
 end
 
 
-local function current_command_prefix(window, pane)
+local function current_pane_cols(target)
+    local ok_dimensions, dimensions = pcall(function()
+        return target:get_dimensions()
+    end)
+    if ok_dimensions and dimensions and dimensions.cols then
+        return dimensions.cols
+    end
+    return nil
+end
+
+local function current_command_right_text(target, cursor)
+    if not target or not cursor or not cursor.y then return '' end
+
+    local cols = current_pane_cols(target)
+    if not cols or cols <= (cursor.x or 0) then return '' end
+
+    local ok_region, text = pcall(function()
+        return target:get_text_from_region(cursor.x or 0, cursor.y, cols, cursor.y)
+    end)
+    if not ok_region or not text or text == '' then return '' end
+
+    return last_line(text):gsub('%s+$', '')
+end
+
+local function remove_right_text_overlap(completion, right_text)
+    if not completion or completion == '' or not right_text or right_text == '' then
+        return completion
+    end
+
+    if completion:sub(1, #right_text) == right_text then
+        return ''
+    end
+    if right_text:sub(1, #completion) == completion then
+        return ''
+    end
+
+    local max = math.min(#completion, #right_text)
+    for size = max, 1, -1 do
+        if completion:sub(#completion - size + 1) == right_text:sub(1, size) then
+            return completion:sub(1, #completion - size)
+        end
+    end
+
+    return completion
+end
+
+local function current_command_context(window, pane)
     local target = active_pane_for(window, pane)
-    if not target then return nil, nil end
+    if not target then return nil, nil, nil end
 
     local ok_cursor, cursor = pcall(function()
         return target:get_cursor_position()
@@ -414,7 +536,8 @@ local function current_command_prefix(window, pane)
         if ok_region and text and text ~= '' then
             local raw = last_line(text)
             local prefix = strip_common_prompt(raw)
-            return multiline_command_prefix(target, raw, prefix)
+            local multiline_prefix, multiline_raw = multiline_command_prefix(target, raw, prefix)
+            return multiline_prefix, multiline_raw, current_command_right_text(target, cursor)
         end
     end
 
@@ -424,13 +547,14 @@ local function current_command_prefix(window, pane)
     if ok_line and text and text ~= '' then
         local raw = last_line(text)
         local prefix = strip_common_prompt(raw)
-        return multiline_command_prefix(target, raw, prefix)
+        local multiline_prefix, multiline_raw = multiline_command_prefix(target, raw, prefix)
+        return multiline_prefix, multiline_raw, ''
     end
 
-    return nil, nil
+    return nil, nil, nil
 end
 
-local function sanitize_completion(response, prefix, raw_line)
+local function sanitize_completion(response, prefix, raw_line, right_text)
     local text = tostring(response or ''):gsub('\r', '')
     text = text:gsub('^```[^\n]*\n', ''):gsub('\n```%s*$', '')
     local inline = text:match('^%s*`([^`]+)`%s*$')
@@ -438,20 +562,21 @@ local function sanitize_completion(response, prefix, raw_line)
     text = text:gsub('^\n+', ''):gsub('\n+$', '')
 
     local trimmed = text:match('^%s*(.-)%s*$') or ''
-    if trimmed:match('^Error:') then return '' end
+    if trimmed:match('^Error:') then return '', trimmed end
     if prefix and prefix ~= '' and text:sub(1, #prefix) == prefix then
-        return text:sub(#prefix + 1)
+        text = text:sub(#prefix + 1)
+    elseif raw_line and raw_line ~= '' and text:sub(1, #raw_line) == raw_line then
+        text = text:sub(#raw_line + 1)
     end
-    if raw_line and raw_line ~= '' and text:sub(1, #raw_line) == raw_line then
-        return text:sub(#raw_line + 1)
-    end
-    return text
+
+    return remove_right_text_overlap(text, right_text), nil
 end
 
 local completion_system_prompt = table.concat({
     'You complete partially typed shell commands, including multiline commands.',
-    'Return only the exact suffix to append at the cursor on the current line.',
-    'Use prior lines only as context; do not repeat existing lines unless no shorter suffix is possible.',
+    'Return only the exact suffix to insert at the cursor on the current line.',
+    'Use prior lines and any right-of-cursor text only as context.',
+    'Do not repeat existing prefix or right-of-cursor text.',
     'Do not include markdown, quotes, explanations, or trailing newline.',
     'Prefer safe, boring, idiomatic shell completions.',
     'If there is no useful safe completion, return an empty response.',
@@ -698,7 +823,7 @@ function M.complete_current_command(window, pane)
     local target = active_pane_for(window, pane)
     if not target then return end
 
-    local prefix, raw_line = current_command_prefix(window, target)
+    local prefix, raw_line, right_text = current_command_context(window, target)
     if not prefix or prefix == '' then return end
 
     local cwd = ''
@@ -720,27 +845,37 @@ function M.complete_current_command(window, pane)
         'Editable command prefix (may be multiline):',
         prefix,
         '',
+        'Existing right-of-cursor text (do not repeat):',
+        right_text or '',
+        '',
         'Current working directory:',
         cwd,
         '',
         'Foreground process:',
         process_name,
         '',
-        'Return only the suffix to append at the cursor on the current line.',
+        'Return only the suffix to insert at the cursor before the right-of-cursor text.',
     }, '\n')
 
     local config = config_with_theme(cfg.get(), window)
     set_completion_indicator(window, 'working', prefix)
     schedule_after_ui(function()
-        provider.call(config, completion_system_prompt, prompt, function(response)
-            local completion = sanitize_completion(response, prefix, raw_line)
-            if completion and completion ~= '' then
-                send_text(window, target, completion)
-                set_completion_indicator(window, 'done', prefix .. completion)
-            else
-                set_completion_indicator(window, 'empty', prefix)
-            end
-        end, { max_tokens = 160 })
+        local ok_call, call_err = pcall(function()
+            provider.call(config, completion_system_prompt, prompt, function(response)
+                local completion, completion_err = sanitize_completion(response, prefix, raw_line, right_text)
+                if completion_err then
+                    set_completion_indicator(window, 'error', completion_err)
+                elseif completion and completion ~= '' then
+                    send_text(window, target, completion)
+                    set_completion_indicator(window, 'done', prefix .. completion)
+                else
+                    set_completion_indicator(window, 'empty', prefix)
+                end
+            end, { max_tokens = 160 })
+        end)
+        if not ok_call then
+            set_completion_indicator(window, 'error', tostring(call_err))
+        end
     end)
 end
 
