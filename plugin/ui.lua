@@ -109,11 +109,52 @@ local function truncate_text(text, limit)
     return text:sub(1, limit - 1) .. '…'
 end
 
-local function danger_badge(entry)
-    local haystack = ((entry.cmd or '') .. '\n' .. (entry.desc or '')):lower()
-    if haystack:find('rm%s+%-rf') or haystack:find('delete') or haystack:find('drop%s+') or haystack:find('kill%s+') then
-        return '  ⚠'
+local function first_shell_word(line)
+    local rest = tostring(line or ''):match('^%s*(.-)%s*$') or ''
+    while true do
+        local next_rest = rest:match('^%w+[%w_]*=[^%s]+%s+(.+)$')
+        if not next_rest then break end
+        rest = next_rest
     end
+    if rest:match('^sudo%s+') then rest = rest:gsub('^sudo%s+', '') end
+    if rest:match('^command%s+') then rest = rest:gsub('^command%s+', '') end
+    return rest:match('^([%w_./-]+)'), rest
+end
+
+local function is_dangerous_command(command)
+    local text = tostring(command or ''):lower()
+    if text == '' then return false end
+
+    for line in (text .. '\n'):gmatch('([^\n]*)\n') do
+        local word, rest = first_shell_word(line)
+        if word then
+            word = word:match('([^/]+)$') or word
+            if word == 'rm'
+                or word:match('^mkfs')
+                or word == 'dd'
+                or word == 'shutdown'
+                or word == 'reboot'
+                or word == 'kill'
+                or word == 'pkill'
+                or word == 'drop'
+            then
+                return true
+            end
+            if word == 'git' then
+                if rest:match('%f[%w]clean%f[%W]') then return true end
+                if rest:match('%f[%w]reset%f[%W]') and rest:match('%-%-hard') then return true end
+            end
+        end
+    end
+
+    if text:match('%f[%w]drop%s+table%f[%W]') or text:match('%f[%w]drop%s+database%f[%W]') then
+        return true
+    end
+    return false
+end
+
+local function danger_badge(entry)
+    if is_dangerous_command(entry.cmd) then return '  ⚠' end
     return ''
 end
 
@@ -430,6 +471,109 @@ local function current_command_prefix(window, pane)
     return nil, nil
 end
 
+local function file_url_to_path(value)
+    local text = tostring(value or '')
+    text = text:gsub('^file://', '')
+    text = text:gsub('%%(%x%x)', function(hex)
+        return string.char(tonumber(hex, 16))
+    end)
+    return text
+end
+
+local function current_working_dir_for(target)
+    if not target then return nil end
+    local ok, value = pcall(function()
+        return target:get_current_working_dir()
+    end)
+    if not ok or not value then return nil end
+    local path = file_url_to_path(value)
+    if path == '' then return nil end
+    return path
+end
+
+local function foreground_process_for(target)
+    if not target then return nil end
+    local ok, value = pcall(function()
+        return target:get_foreground_process_name()
+    end)
+    if not ok or not value then return nil end
+    local process = tostring(value)
+    if process == '' then return nil end
+    return process:match('([^/]+)$') or process
+end
+
+local function read_first_line(path)
+    local file = io.open(path, 'r')
+    if not file then return nil end
+    local line = file:read('*l')
+    file:close()
+    return line
+end
+
+local function git_branch_for(cwd)
+    if not cwd or cwd == '' then return nil end
+    local dir = cwd
+    while dir and dir ~= '' do
+        local head = read_first_line(dir .. '/.git/HEAD')
+        if head then
+            local branch = head:match('^ref:%s+refs/heads/(.+)$')
+            if branch and branch ~= '' then return branch end
+            if head ~= '' then return head:sub(1, 12) end
+        end
+        local gitdir = read_first_line(dir .. '/.git')
+        if gitdir then
+            local relative = gitdir:match('^gitdir:%s+(.+)$')
+            if relative then
+                local git_path = relative:match('^/') and relative or (dir .. '/' .. relative)
+                head = read_first_line(git_path .. '/HEAD')
+                if head then
+                    local branch = head:match('^ref:%s+refs/heads/(.+)$')
+                    if branch and branch ~= '' then return branch end
+                    if head ~= '' then return head:sub(1, 12) end
+                end
+            end
+        end
+        local parent = dir:match('^(.+)/[^/]+/?$')
+        if not parent or parent == dir then break end
+        dir = parent
+    end
+    return nil
+end
+
+local function terminal_context_for(window, pane)
+    local target = active_pane_for(window, pane)
+    if not target then return '' end
+
+    local cwd = current_working_dir_for(target)
+    local process = foreground_process_for(target)
+    local prefix, raw_line = current_command_prefix(window, target)
+    local branch = git_branch_for(cwd)
+    local lines = {}
+
+    if cwd then table.insert(lines, 'Current working directory: ' .. cwd) end
+    if branch then table.insert(lines, 'Git branch: ' .. branch) end
+    if process then table.insert(lines, 'Foreground process/shell: ' .. process) end
+    if raw_line and raw_line ~= '' then table.insert(lines, 'Visible prompt/current line: ' .. raw_line) end
+    if prefix and prefix ~= '' then table.insert(lines, 'Stripped current command line: ' .. prefix) end
+
+    if #lines == 0 then return '' end
+    return table.concat(lines, '\n')
+end
+
+local function provider_context_for(window, pane, selected_context)
+    local chunks = {}
+    if selected_context and selected_context ~= '' then
+        table.insert(chunks, 'Selected terminal text:\n' .. selected_context)
+    end
+
+    local terminal_context = terminal_context_for(window, pane)
+    if terminal_context ~= '' then
+        table.insert(chunks, 'Shell context:\n' .. terminal_context)
+    end
+
+    return table.concat(chunks, '\n\n')
+end
+
 local function sanitize_completion(response, prefix, raw_line)
     local text = tostring(response or ''):gsub('\r', '')
     text = text:gsub('^```[^\n]*\n', ''):gsub('\n```%s*$', '')
@@ -458,13 +602,142 @@ local completion_system_prompt = table.concat({
 }, '\n')
 
 
--- Process a prompt with optional context: call AI, parse response, show selector
-local function process_prompt_with_context(user_prompt, context, window, pane)
-    local config = config_with_theme(cfg.get(), window)
-    history.save(user_prompt)
+local process_prompt_with_context
 
-    local api_prompt = table.concat({
+local function confirm_or_insert_command(window, pane, entry)
+    if not entry or not entry.cmd then return end
+    if not is_dangerous_command(entry.cmd) then
+        send_text(window, pane, entry.cmd)
+        return
+    end
+
+    perform_action(
+        window,
+        pane,
+        act.InputSelector {
+            action = wezterm.action_callback(function(window, pane, id)
+                if id == 'insert' then
+                    send_text(window, pane, entry.cmd)
+                end
+            end),
+            title = 'AI Commander · Confirm Dangerous Command',
+            choices = {
+                { id = 'insert', label = '⚠ Insert anyway: ' .. truncate_text(entry.cmd, 96) },
+                { id = 'cancel', label = 'Cancel' },
+            },
+            description = 'This command may destroy data or stop processes. It will not be pasted unless you explicitly choose Insert anyway.',
+        }
+    )
+end
+
+local function show_prompt_input(window, pane, selected_context, seed_prompt, title_suffix, on_submit)
+    local context_text = (selected_context and selected_context ~= '') and 'selected context: on' or 'selected context: off'
+    local seed_hint = (seed_prompt and seed_prompt ~= '') and ('  │  edit: ' .. truncate_text(seed_prompt, 70)) or '  │  describe shell task'
+    local context_description = formatted {
+        { Foreground = { AnsiColor = 'Fuchsia' } },
+        { Attribute = { Intensity = 'Bold' } },
+        { Text = 'AI Commander · ' .. (title_suffix or 'Command Prompt') },
+        'ResetAttributes',
+        { Foreground = { AnsiColor = 'Silver' } },
+        { Text = '  │  ' },
+        { Foreground = { AnsiColor = 'Aqua' } },
+        { Text = context_text },
+        { Foreground = { AnsiColor = 'Silver' } },
+        { Text = seed_hint },
+    }
+
+    perform_action(
+        window,
+        pane,
+        act.PromptInputLine {
+            description = context_description,
+            prompt = formatted {
+                { Foreground = { AnsiColor = 'Fuchsia' } },
+                { Attribute = { Intensity = 'Bold' } },
+                { Text = '❯ ' },
+            },
+            initial_value = seed_prompt or '',
+            action = wezterm.action_callback(function(window, pane, line)
+                if not line or line == '' then
+                    return
+                end
+                on_submit(window, pane, line)
+            end),
+        }
+    )
+end
+
+local function submit_prompt(window, pane, selected_context, prompt, opts)
+    show_generating_selector(prompt, selected_context, window, pane)
+    schedule_after_ui(function()
+        process_prompt_with_context(prompt, selected_context, window, pane, opts)
+    end)
+end
+
+local function show_command_selector(user_prompt, selected_context, commands, window, pane)
+    if #commands == 1 then
+        confirm_or_insert_command(window, pane, commands[1])
+        return
+    end
+
+    local choices = {
+        { id = '__regenerate__', label = '↻ Regenerate alternatives' },
+        { id = '__refine__', label = '✎ Refine prompt before regenerating' },
+    }
+    for idx, entry in ipairs(commands) do
+        table.insert(choices, {
+            id = tostring(idx),
+            label = build_command_label(entry),
+        })
+    end
+
+    perform_action(
+        window,
+        pane,
+        act.InputSelector {
+            action = wezterm.action_callback(function(window, pane, id)
+                if id == '__regenerate__' then
+                    submit_prompt(window, pane, selected_context, user_prompt, {
+                        instruction = 'Regenerate a fresh set of command alternatives. Avoid repeating prior commands unless they are clearly best.',
+                        save_history = false,
+                    })
+                    return
+                end
+                if id == '__refine__' then
+                    show_prompt_input(window, pane, selected_context, user_prompt, 'Refine Command Prompt', function(window, pane, line)
+                        submit_prompt(window, pane, selected_context, line, {
+                            instruction = 'Refine the previous command generation request using the edited prompt.',
+                        })
+                    end)
+                    return
+                end
+                if id then
+                    local selected = commands[tonumber(id)]
+                    if selected then
+                        confirm_or_insert_command(window, pane, selected)
+                    end
+                end
+            end),
+            title = 'AI Commander · Choose Command',
+            choices = choices,
+            description = 'Pick a command to paste, regenerate, or refine. Press / to filter; ⚠ requires confirmation.',
+        }
+    )
+end
+
+-- Process a prompt with optional context: call AI, parse response, show selector
+process_prompt_with_context = function(user_prompt, selected_context, window, pane, opts)
+    opts = opts or {}
+    local config = config_with_theme(cfg.get(), window)
+    if opts.save_history ~= false then history.save(user_prompt) end
+
+    local prompt_lines = {
         'Task: ' .. user_prompt,
+    }
+    if opts.instruction and opts.instruction ~= '' then
+        table.insert(prompt_lines, 'Instruction: ' .. opts.instruction)
+    end
+    for _, line in ipairs({
         '',
         'Generate ' .. config.command_count .. ' different command options to accomplish the task above.',
         '',
@@ -497,9 +770,12 @@ local function process_prompt_with_context(user_prompt, context, window, pane)
         '    command: ["sleep", "infinity"]',
         'EOF',
         '## Create a netshoot debugging pod via heredoc manifest',
-    }, '\n')
+    }) do
+        table.insert(prompt_lines, line)
+    end
+    local api_prompt = table.concat(prompt_lines, '\n')
 
-    api_prompt = with_context(api_prompt, context)
+    api_prompt = with_context(api_prompt, provider_context_for(window, pane, selected_context))
 
     provider.call(config, config.system_prompt, api_prompt, function(response)
         -- Parse response into command + description pairs.
@@ -545,40 +821,11 @@ local function process_prompt_with_context(user_prompt, context, window, pane)
             table.remove(last_results)
         end
 
-        if #commands == 1 then
-            send_text(window, pane, commands[1].cmd)
-            return
-        end
-
-        local choices = {}
-        for idx, entry in ipairs(commands) do
-            table.insert(choices, {
-                id = tostring(idx),
-                label = build_command_label(entry),
-            })
-        end
-
-        perform_action(
-            window,
-            pane,
-            act.InputSelector {
-                action = wezterm.action_callback(function(window, pane, id, label)
-                    if id then
-                        local selected = commands[tonumber(id)]
-                        if selected then
-                            send_text(window, pane, selected.cmd)
-                        end
-                    end
-                end),
-                title = 'AI Commander · Choose Command',
-                choices = choices,
-                description = 'Pick a command to paste into the pane. Press / to filter; multiline commands show ↵.',
-            }
-        )
+        show_command_selector(user_prompt, selected_context, commands, window, pane)
     end)
 end
 
--- Show prompt history and re-run selected prompt
+-- Show prompt history and edit selected prompt before submitting
 function M.show_history(window, pane)
     local hist = history.load()
 
@@ -605,21 +852,20 @@ function M.show_history(window, pane)
         window,
         pane,
         act.InputSelector {
-            action = wezterm.action_callback(function(window, pane, id, label)
+            action = wezterm.action_callback(function(window, pane, id)
                 if id then
                     local selected_prompt = hist[tonumber(id)]
                     if selected_prompt then
                         local selection = selection_text_for_pane(window, pane)
-                        show_generating_selector(selected_prompt, selection, window, pane)
-                        schedule_after_ui(function()
-                            process_prompt_with_context(selected_prompt, selection, window, pane)
+                        show_prompt_input(window, pane, selection, selected_prompt, 'Edit History Prompt', function(window, pane, line)
+                            submit_prompt(window, pane, selection, line)
                         end)
                     end
                 end
             end),
             title = 'AI Commander · Prompt History',
             choices = choices,
-            description = 'Choose a previous prompt to regenerate. Waiting panel stays visible while AI works.',
+            description = 'Choose a previous prompt to edit. AI runs only after you submit the edited prompt.',
         }
     )
 end
@@ -661,11 +907,11 @@ function M.show_last_results(window, pane)
         window,
         pane,
         act.InputSelector {
-            action = wezterm.action_callback(function(window, pane, id, label)
+            action = wezterm.action_callback(function(window, pane, id)
                 if id and id ~= '__header__' then
                     local mapping = choice_map[id]
                     if mapping then
-                        send_text(window, pane, mapping.cmd)
+                        confirm_or_insert_command(window, pane, mapping)
                     end
                 end
             end),
@@ -747,42 +993,22 @@ end
 -- Show prompt input and process the entered prompt
 function M.show_prompt(window, pane)
     local selection = selection_text_for_pane(window, pane)
-    local context_text = (selection and selection ~= '') and 'selected context: on' or 'selected context: off'
-    local context_description = formatted {
-        { Foreground = { AnsiColor = 'Fuchsia' } },
-        { Attribute = { Intensity = 'Bold' } },
-        { Text = 'AI Commander · Command Prompt' },
-        'ResetAttributes',
-        { Foreground = { AnsiColor = 'Silver' } },
-        { Text = '  │  ' },
-        { Foreground = { AnsiColor = 'Aqua' } },
-        { Text = context_text },
-        { Foreground = { AnsiColor = 'Silver' } },
-        { Text = '  │  describe shell task' },
-    }
+    show_prompt_input(window, pane, selection, nil, 'Command Prompt', function(window, pane, line)
+        submit_prompt(window, pane, selection, line)
+    end)
+end
 
-    perform_action(
-        window,
-        pane,
-        act.PromptInputLine {
-            description = context_description,
-            prompt = formatted {
-                { Foreground = { AnsiColor = 'Fuchsia' } },
-                { Attribute = { Intensity = 'Bold' } },
-                { Text = '❯ ' },
-            },
-            action = wezterm.action_callback(function(window, pane, line)
-                if not line or line == '' then
-                    return
-                end
+-- Re-run the most recent prompt with current selected context
+function M.repeat_last_prompt(window, pane)
+    local hist = history.load()
+    local last_prompt = hist[1]
+    if not last_prompt or last_prompt == '' then
+        send_text(window, pane, "# No prompt history available")
+        return
+    end
 
-                show_generating_selector(line, selection, window, pane)
-                schedule_after_ui(function()
-                    process_prompt_with_context(line, selection, window, pane)
-                end)
-            end),
-        }
-    )
+    local selection = selection_text_for_pane(window, pane)
+    submit_prompt(window, pane, selection, last_prompt, { save_history = false })
 end
 
 local function chat_backend_args(config, context)

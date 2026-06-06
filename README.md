@@ -23,7 +23,8 @@ AI Commander stays out of your way. Press a hotkey, type your question, get the 
 - **Multiple Options** — generates several command variants to choose from (default: 5)
 - **Context-Aware** — select text in the terminal (error messages, file paths, logs) and use it as context
 - **Results Recall** — browse and reuse previously generated commands without re-querying the API
-- **Prompt History** — access and re-run previous prompts from a persistent history file
+- **Prompt History** — access previous prompts, edit them, then submit explicitly
+- **Safe Insert Guard** — destructive commands require confirmation before being pasted
 - **Syntax Highlighting** — commands are highlighted via `bat` (if installed) in the selection menu
 - **Pluggable Providers** — Anthropic Messages and OpenAI Responses built in; provider support lives in the Python backend plus Lua diagnostics
 - **Subscription OAuth** — can reuse Claude Code and Codex CLI login credentials instead of manual API keys
@@ -67,6 +68,7 @@ ai.apply_to_config(config, {
 config.keys = {
   { key = 'X', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_prompt(w, p) end) },
   { key = 'X', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_last_results(w, p) end) },
+  { key = 'R', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.repeat_last_prompt(w, p) end) },
   { key = 'H', mods = 'ALT|SHIFT',  action = wezterm.action_callback(function(w, p) ai.show_history(w, p) end) },
   { key = 'A', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.show_ask_inline(w, p) end) },
   { key = 'E', mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(w, p) ai.complete_current_command(w, p) end) },
@@ -82,7 +84,8 @@ return config
 |-----------------------|----------------------|------------------------------------------------|
 | `show_prompt(w, p)`       | `Alt+Shift+X`       | Open prompt input, generate commands from text |
 | `show_last_results(w, p)` | `Ctrl+Shift+X`      | Recall previously generated commands           |
-| `show_history(w, p)`      | `Alt+Shift+H`       | Browse and re-run previous prompts             |
+| `repeat_last_prompt(w, p)` | `Alt+Shift+R`      | Re-run the most recent prompt with current context |
+| `show_history(w, p)`      | `Alt+Shift+H`       | Browse previous prompts and edit before submit |
 | `show_ask_inline(w, p)`   | `Ctrl+Shift+A`      | Ask AI a question, stream response in split pane |
 | `complete_current_command(w, p)` | `Ctrl+Shift+E` | Complete the currently typed shell command |
 | `check_provider(w, p)`     | `Ctrl+Shift+P`      | Validate credentials, endpoint, dependencies, and config |
@@ -90,9 +93,9 @@ return config
 ### Command Generation
 
 1. Press `Alt+Shift+X` → type what you need (e.g. *"find all PDF files modified today"*)
-2. AI Commander keeps a branded “Generating Commands” selector open while the backend works
-3. Pick one of the styled command options from the selector (press `/` to filter; `↵` marks multiline commands)
-4. The command is inserted into your terminal
+2. AI Commander sends selected text plus shell context (cwd, foreground process, current line, git branch when available) alongside your prompt
+3. Pick one of the styled command options, or choose regenerate/refine from the selector
+4. Safe commands are inserted into your terminal; destructive commands show a confirmation selector first
 
 ### Command Completion
 
@@ -129,7 +132,7 @@ Press `Ctrl+Shift+X` to browse commands from previous prompts grouped by query. 
 
 ### Prompt History
 
-Press `Alt+Shift+H` to pick a previous prompt and re-run it. History is persisted to a file across WezTerm restarts.
+Press `Alt+Shift+H` to pick a previous prompt, edit it, and submit explicitly. Press `Alt+Shift+R` to repeat the most recent prompt immediately with the current selected context. History is persisted to a file across WezTerm restarts.
 
 ## Configuration
 

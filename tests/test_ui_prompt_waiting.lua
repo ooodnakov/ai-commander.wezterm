@@ -7,6 +7,7 @@ local right_statuses = {}
 local provider_called_after_waiting = false
 local sent_text = ''
 local completion_prompt = nil
+local command_prompt = nil
 local completion_mode = 'single'
 
 local function assert_truthy(value, label)
@@ -84,6 +85,7 @@ package.preload['provider'] = function()
                 end
                 return
             end
+            command_prompt = prompt
             provider_called_after_waiting = actions[#actions] and actions[#actions].title == 'AI Commander · Generating Commands'
             callback('printf ok\n## Print ok\nprintf nope\n## Print nope')
         end,
@@ -172,9 +174,12 @@ timers[1]()
 assert_truthy(provider_called_after_waiting, 'provider starts after waiting selector is visible')
 assert_equal(actions[3].kind, 'InputSelector', 'provider callback replaces waiting selector with command selector')
 assert_equal(actions[3].title, 'AI Commander · Choose Command', 'command selector title')
-assert_truthy(actions[3].description:find('multiline commands show', 1, true), 'command selector explains badges')
-assert_equal(#actions[3].choices, 2, 'command selector has parsed choices')
-assert_truthy(not actions[3].choices[1].label:find('1%.', 1), 'choice label does not duplicate selector numbering')
+assert_truthy(actions[3].description:find('regenerate', 1, true), 'command selector exposes regenerate path')
+assert_equal(#actions[3].choices, 4, 'command selector has action rows and parsed choices')
+assert_truthy(not actions[3].choices[3].label:find('1%.', 1), 'choice label does not duplicate selector numbering')
+assert_truthy(command_prompt:find('Selected terminal text:\nctx', 1, true), 'generation prompt includes selected terminal context')
+assert_truthy(command_prompt:find('Current working directory: /home/odnakov/src/ai%-commander%.wezterm'), 'generation prompt includes cwd shell context')
+assert_truthy(command_prompt:find('Foreground process/shell: zsh', 1, true), 'generation prompt includes foreground process')
 
 actions[3].action(window, stale_pane, '1')
 assert_equal(sent_text, 'printf ok', 'selector pastes chosen command')

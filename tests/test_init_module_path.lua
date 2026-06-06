@@ -41,6 +41,7 @@ package.loaded['config'] = { stale = true }
 local plugin = require('plugin.init')
 
 assert_equal(type(plugin.show_prompt), 'function', 'plugin loaded')
+assert_equal(type(plugin.repeat_last_prompt), 'function', 'repeat-last API exported')
 assert_equal(package.loaded.ui.stale, nil, 'stale ui module cleared')
 assert_equal(package.loaded.config.stale, nil, 'stale config module cleared')
 assert(package.path:find('./plugin/?.lua', 1, true), 'configured local plugin path is prepended')
