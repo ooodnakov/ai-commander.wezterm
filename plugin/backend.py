@@ -1101,6 +1101,86 @@ def transcript_text(transcript: list[dict[str, str]]) -> str:
         parts.append(f"{role.upper()}:\n{content}")
     return "\n\n".join(parts) + ("\n" if parts else "")
 
+TRANSCRIPT_HEADER_RE = re.compile(r"(?m)^(USER|ASSISTANT):\n")
+
+
+def parse_transcript_text(body: str) -> list[dict[str, str]]:
+    matches = list(TRANSCRIPT_HEADER_RE.finditer(body))
+    messages: list[dict[str, str]] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        content = body[start:end]
+        if content.endswith("\n\n"):
+            content = content[:-2]
+        elif content.endswith("\n"):
+            content = content[:-1]
+        messages.append({"role": match.group(1).lower(), "content": content})
+    return messages
+
+
+def transcript_paths() -> list[Path]:
+    target_dir = chat_state_dir() / "transcripts"
+    try:
+        paths = [path for path in target_dir.iterdir() if path.is_file()]
+    except OSError:
+        return []
+    paths.sort(key=lambda path: (path.stat().st_mtime_ns, path.name), reverse=True)
+    return paths
+
+
+def load_transcript_path(path: Path) -> list[dict[str, str]]:
+    try:
+        body = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise BackendError(f"Cannot read transcript: {path}") from exc
+    messages = parse_transcript_text(body)
+    if not messages:
+        raise BackendError(f"Invalid transcript: {path}")
+    return messages
+
+
+def handle_load_command(
+    command: str,
+    config: dict[str, Any],
+    history: list[dict[str, str]],
+    transcript: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    parts = command.strip().split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else "latest"
+    paths = transcript_paths()
+    if arg == "list":
+        if not paths:
+            print("No saved transcripts found.", flush=True)
+            return history, transcript
+        print("Recent transcripts:", flush=True)
+        for index, path in enumerate(paths[:10], start=1):
+            print(f"{index}. {path}", flush=True)
+        return history, transcript
+
+    try:
+        if arg == "latest":
+            if not paths:
+                raise BackendError("No saved transcripts found.")
+            path = paths[0]
+        elif arg.isdigit():
+            index = int(arg)
+            if index <= 0 or index > len(paths):
+                raise BackendError(f"No transcript #{index}. Use /load list.")
+            path = paths[index - 1]
+        else:
+            path = Path(expand_path(arg) or arg)
+        loaded = load_transcript_path(path)
+    except BackendError as exc:
+        print(f"Load failed: {exc}", flush=True)
+        return history, transcript
+
+    history = trim_history(loaded.copy(), config.get("max_conversation_messages"))
+    transcript = loaded.copy()
+    save_history(config, history)
+    print(f"Transcript loaded: {path} ({len(loaded)} messages)", flush=True)
+    return history, transcript
+
 
 def chat_state_dir() -> Path:
     xdg_state = os.environ.get("XDG_STATE_HOME")
@@ -1182,6 +1262,9 @@ def handle_chat_command(
     if name == "/save":
         path = save_transcript(transcript)
         print(f"Transcript saved: {path}", flush=True)
+        return True, history, transcript
+    if name == "/load":
+        history, transcript = handle_load_command(command, config, history, transcript)
         return True, history, transcript
     if name == "/copy":
         if copy_transcript_osc52(transcript):
