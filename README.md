@@ -34,11 +34,11 @@ AI Commander stays out of your way. Press a hotkey, type your question, get the 
 ## Prerequisites
 
 - **WezTerm** — recent version with Lua plugin support
-- **Python 3 backend venv** — provider calls and Rich markdown rendering:
+- **Python 3 backend venv** — provider calls and Rich markdown rendering. Create or repair it explicitly:
   ```sh
-  python -m venv ~/.local/share/ai-commander.wezterm/venv
-  ~/.local/share/ai-commander.wezterm/venv/bin/python -m pip install -r requirements.txt
+  python3 plugin/backend.py setup
   ```
+  This creates `~/.local/share/ai-commander.wezterm/venv` and installs `requirements.txt`. Nothing is installed automatically during WezTerm config/plugin load.
 - **API key** from [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/), or local OAuth/subscription credentials from Claude Code/Codex CLI
 - **bat** (optional) — for syntax highlighting in the command selector
 
@@ -88,7 +88,8 @@ return config
 | `show_history(w, p)`      | `Alt+Shift+H`       | Browse previous prompts and edit before submit |
 | `show_ask_inline(w, p)`   | `Ctrl+Shift+A`      | Ask AI a question, stream response in split pane |
 | `complete_current_command(w, p)` | `Ctrl+Shift+E` | Complete the currently typed shell command |
-| `check_provider(w, p)`     | `Ctrl+Shift+P`      | Validate credentials, endpoint, dependencies, and config |
+| `check_provider(w, p)`     | `Ctrl+Shift+P`      | Validate credentials, model, token limits, endpoint, dependencies, renderer, and config |
+| `setup_backend(w, p)`      | manual only          | Explicitly create/repair backend venv and install dependencies |
 
 ### Command Generation
 
@@ -251,16 +252,42 @@ For Codex/OpenAI, OAuth mode checks `CODEX_AUTH_TOKEN`, `OPENAI_AUTH_TOKEN`, `CH
 OpenAI uses the Responses API (`https://api.openai.com/v1/responses`) for both blocking command generation and streaming ask mode. The OpenAI provider sends the system prompt as `instructions`, user text as `input`, output limits as `max_output_tokens`, requests low reasoning effort for GPT-5/o-series models such as `gpt-5.5`, and parses `response.output_text.delta` events while streaming.
 
 
+### Backend Setup / Doctor
+
+Use backend CLI helpers explicitly when setting up a new machine or repairing dependencies:
+
+```sh
+python3 plugin/backend.py setup
+```
+
+Useful variants:
+
+```sh
+python3 plugin/backend.py setup --no-install
+python3 plugin/backend.py setup --recreate
+python3 plugin/backend.py doctor --config /path/to/backend-config.json
+```
+
+`setup` creates/checks the backend venv and installs `requests`/`rich` from `requirements.txt`. `doctor` checks the expected venv path plus provider/backend diagnostics. These commands are never run automatically by plugin load.
+
+
 ### Provider Health Check
 
-Run `ai.check_provider(w, p)` from a keybinding to print diagnostics into the current pane. It checks:
+Run `ai.check_provider(w, p)` from a keybinding to print concise diagnostics into the current pane. It checks:
 
-- active provider and config validation warnings
-- credential resolution for the selected auth mode
-- Python backend, `requests`, and Rich availability
-- renderer availability when configured; raw markdown fallback otherwise
+- active provider, active model, and token limits
+- selected auth mode, resolved auth type, and endpoint
+- Python interpreter path, backend path, venv prefix, and dependency versions (`requests`, `rich`, Python)
+- renderer state/availability and config validation warnings
+- debug directory when `WEZTERM_AI_COMMANDER_DEBUG=1`
 
 The helper returns the same report table it prints, so advanced configs can call it programmatically.
+
+### Debug Logs
+
+Set `WEZTERM_AI_COMMANDER_DEBUG=1` to write backend debug files under `$WEZTERM_AI_COMMANDER_DEBUG_DIR`, `$WEZTERM_AI_COMMANDER_STATE_DIR/debug`, or `~/.local/state/ai-commander.wezterm/debug`.
+
+Debug captures backend command metadata, redacted request/response data, SSE lines/events, renderer state, and compact history JSON snapshots. Authorization headers, API keys, OAuth tokens, bearer tokens, and credential fields are redacted before writing. Backend checks/errors print the debug directory when enabled.
 
 ### Conversation Continuity
 

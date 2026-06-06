@@ -7,6 +7,7 @@ import contextlib
 import io
 import tempfile
 import json
+import os
 
 
 BACKEND_PATH = Path(__file__).resolve().parents[1] / "plugin" / "backend.py"
@@ -273,6 +274,54 @@ def test_rich_renderer_uses_live_markdown_updates():
     assert "\x1b8\x1b[J" not in output
 
 
+def test_debug_json_redacts_tokens_and_summarizes_history():
+    backend = load_backend()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        old_debug = os.environ.get("WEZTERM_AI_COMMANDER_DEBUG")
+        old_dir = os.environ.get("WEZTERM_AI_COMMANDER_DEBUG_DIR")
+        os.environ["WEZTERM_AI_COMMANDER_DEBUG"] = "1"
+        os.environ["WEZTERM_AI_COMMANDER_DEBUG_DIR"] = tmpdir
+        try:
+            path = backend.write_debug_json(
+                "request",
+                {
+                    "headers": {"Authorization": "Bearer secret-token-value"},
+                    "api_key": "sk-test-secret",
+                    "body": {"input": "hello"},
+                },
+            )
+            assert path is not None
+            text = Path(path).read_text(encoding="utf-8")
+            assert "secret-token-value" not in text
+            assert "sk-test-secret" not in text
+            assert "<redacted>" in text
+
+            snapshot = backend.summarize_history(
+                [{"role": "user", "content": "do not write this secret"}]
+            )
+            assert snapshot["message_count"] == 1
+            assert "content_sha256" in snapshot["messages"][0]
+            assert "do not write this secret" not in json.dumps(snapshot)
+        finally:
+            if old_debug is None:
+                os.environ.pop("WEZTERM_AI_COMMANDER_DEBUG", None)
+            else:
+                os.environ["WEZTERM_AI_COMMANDER_DEBUG"] = old_debug
+            if old_dir is None:
+                os.environ.pop("WEZTERM_AI_COMMANDER_DEBUG_DIR", None)
+            else:
+                os.environ["WEZTERM_AI_COMMANDER_DEBUG_DIR"] = old_dir
+
+
+def test_backend_parser_exposes_explicit_setup_without_running_pip():
+    backend = load_backend()
+    parser = backend.build_parser()
+    args = parser.parse_args(["setup", "--venv", "/tmp/ac-venv", "--no-install"])
+    assert args.mode == "setup"
+    assert args.venv == "/tmp/ac-venv"
+    assert args.no_install is True
+
+
 if __name__ == "__main__":
     test_codex_subscription_request_body_omits_public_api_fields()
     test_openai_sse_parser_yields_text_deltas_only()
@@ -280,4 +329,6 @@ if __name__ == "__main__":
     test_chat_slash_commands_save_copy_and_clear_without_leaking_tokens()
     test_chat_ctrl_c_cancels_response_and_keeps_loop_alive()
     test_rich_renderer_uses_live_markdown_updates()
+    test_debug_json_redacts_tokens_and_summarizes_history()
+    test_backend_parser_exposes_explicit_setup_without_running_pip()
     print("ok")
