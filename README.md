@@ -118,7 +118,9 @@ While completion is running, AI Commander adds a temporary right-status indicato
    - `/model` prints the active provider model
    - `/provider` prints provider, endpoint, and auth type without token values
    - `/save` writes the current pane transcript to `~/.local/state/ai-commander/transcripts/` or `$XDG_STATE_HOME/ai-commander/transcripts/`
-   - `/copy` copies the transcript with OSC 52 when the terminal supports it; otherwise it prints an unsupported message and keeps the pane open
+   - `/load`, `/load latest`, `/load list`, `/load N`, or `/load /path/to/chat.md` reopens saved transcripts
+   - `/copy` copies the transcript with OSC 52 when the terminal supports it
+   - `/copy N`, `/insert N`, and `/run N` act on commands extracted from the latest chat responses; dangerous insert/run actions require typed confirmation
 5. Press `Ctrl+C` while a response streams to cancel that response only; the chat pane stays open
 6. Type `/q`, `:q`, `q`, `quit`, or `exit` to close the chat pane
 
@@ -128,7 +130,8 @@ Rich uses `rich.live.Live(Panel(Markdown(buffer)), refresh_per_second=12, screen
 
 1. **Select text** in the terminal (error message, file listing, log snippet, etc.)
 2. Press `Alt+Shift+X` (or `Ctrl+Shift+A`) → the selected text is sent as context alongside your prompt
-3. AI generates commands/answers that take the context into account
+3. For command generation, AI Commander also sends bounded shell context: cwd, foreground process, current typed command, git branch, and recent terminal output
+4. AI generates commands/answers that take the context into account
 
 ### Recalling Results
 
@@ -210,6 +213,13 @@ ai.apply_to_config(config, {
   conversation_continuity = false, -- true to persist chat context across split panes
   conversation_state_file = wezterm.home_dir .. "/.wezterm_ai_conversation_state.json",
   max_conversation_messages = 12,  -- in-pane and persisted history window
+  max_chat_context_chars = 120000,  -- selected-context char cap; 0 disables
+  max_chat_history_messages = 12,   -- persisted-history message cap; 0 disables
+  max_chat_history_chars = 120000,  -- persisted-history content cap; 0 disables
+
+  -- Command-generation terminal context
+  command_context_output_lines = 40, -- recent terminal output lines; 0 disables
+  command_context_output_chars = 6000, -- recent terminal output char cap; 0 disables
 
   -- System prompts (see plugin/config.lua for full defaults)
   system_prompt = "...",          -- persona for command generation
