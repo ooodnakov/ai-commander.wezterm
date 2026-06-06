@@ -68,9 +68,14 @@ function M.show_prompt(window, pane)
     ui.show_prompt(window, pane)
 end
 
--- Show prompt history and re-run a selected prompt
+-- Show prompt history and edit a selected prompt before re-running
 function M.show_history(window, pane)
     ui.show_history(window, pane)
+end
+
+-- Repeat the most recent prompt with current selected context
+function M.repeat_last_prompt(window, pane)
+    ui.repeat_last_prompt(window, pane)
 end
 
 -- Show last AI-generated results for recall
