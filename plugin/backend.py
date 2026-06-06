@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+from datetime import datetime
 import json
 import os
 import shlex
@@ -875,11 +877,122 @@ def shell_quote_label(value: str, max_len: int = 36) -> str:
     return clean[: max_len - 1] + "…"
 
 
-def print_chat_header(config: dict[str, Any], renderer: str, context: str) -> None:
+def context_summary(context: str) -> tuple[str, str]:
+    if not context.strip():
+        return "none, 0 chars, 0 lines", ""
+    line_count = context.count("\n") + 1
+    char_count = len(context)
+    preview = " ".join(context.split())
+    if len(preview) > 160:
+        preview = preview[:159] + "…"
+    return f"selected, {char_count} chars, {line_count} lines", preview
+
+
+def transcript_text(transcript: list[dict[str, str]]) -> str:
+    parts: list[str] = []
+    for item in transcript:
+        role = str(item.get("role") or "").strip() or "message"
+        content = str(item.get("content") or "")
+        parts.append(f"{role.upper()}:\n{content}")
+    return "\n\n".join(parts) + ("\n" if parts else "")
+
+
+def chat_state_dir() -> Path:
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    if is_non_empty(xdg_state):
+        return Path(xdg_state) / "ai-commander"
+    return Path.home() / ".local" / "state" / "ai-commander"
+
+
+def save_transcript(transcript: list[dict[str, str]]) -> Path:
+    target_dir = chat_state_dir() / "transcripts"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    target = target_dir / f"chat-{timestamp}.md"
+    suffix = 1
+    while target.exists():
+        target = target_dir / f"chat-{timestamp}-{suffix}.md"
+        suffix += 1
+    body = transcript_text(transcript)
+    target.write_text(body or "# AI Commander transcript\n\nNo messages yet.\n", encoding="utf-8")
+    return target
+
+
+def copy_transcript_osc52(transcript: list[dict[str, str]]) -> bool:
+    if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+        return False
+    body = transcript_text(transcript)
+    if not body:
+        return False
+    encoded = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    sys.stdout.write(f"\x1b]52;c;{encoded}\a\n")
+    sys.stdout.flush()
+    return True
+
+
+def provider_status(config: dict[str, Any]) -> str:
+    provider = str(config.get("provider") or DEFAULT_CONFIG["provider"])
+    configured_auth = str((config.get("auth_type") or {}).get(provider) or "api_key")
+    endpoint = str((config.get("api_url") or {}).get(provider) or "")
+    auth = configured_auth
+    try:
+        credential = resolve_auth(config, provider)
+        auth = str(credential.get("type") or configured_auth)
+        endpoint = resolve_endpoint(config, provider, credential)
+    except BackendError:
+        subscription_url = (config.get("subscription_api_url") or {}).get(provider)
+        if configured_auth in ("oauth", "subscription", "codex") and subscription_url:
+            endpoint = str(subscription_url)
+    endpoint_part = f", endpoint {endpoint}" if endpoint else ""
+    return f"Provider: {provider}{endpoint_part}, auth {auth}"
+
+
+def handle_chat_command(
+    command: str,
+    config: dict[str, Any],
+    context: str,
+    history: list[dict[str, str]],
+    transcript: list[dict[str, str]],
+) -> tuple[bool, list[dict[str, str]], list[dict[str, str]]]:
+    name = command.strip().split(maxsplit=1)[0]
+    if name == "/clear":
+        history = []
+        transcript = []
+        save_history(config, history)
+        print("Chat history cleared.", flush=True)
+        return True, history, transcript
+    if name == "/context":
+        summary, preview = context_summary(context)
+        print(f"Context: {summary}", flush=True)
+        if preview:
+            print(f"Preview: {preview}", flush=True)
+        return True, history, transcript
+    if name == "/model":
+        provider = str(config.get("provider") or DEFAULT_CONFIG["provider"])
+        print(f"Model: {model_for(config, provider)}", flush=True)
+        return True, history, transcript
+    if name == "/provider":
+        print(provider_status(config), flush=True)
+        return True, history, transcript
+    if name == "/save":
+        path = save_transcript(transcript)
+        print(f"Transcript saved: {path}", flush=True)
+        return True, history, transcript
+    if name == "/copy":
+        if copy_transcript_osc52(transcript):
+            print("Transcript copied with OSC 52.", flush=True)
+        else:
+            print("Transcript copy unsupported in this terminal/session; use /save instead.", flush=True)
+        return True, history, transcript
+    return False, history, transcript
+
+
+def print_chat_header(config: dict[str, Any], renderer: str, context: str, history_count: int) -> None:
     provider = str(config.get("provider") or DEFAULT_CONFIG["provider"])
     model = model_for(config, provider)
-    context_state = "selected" if context.strip() else "none"
+    context_status, _preview = context_summary(context)
     palette = theme_palette(config.get("theme"))
+    memory_status = f"{history_count} history messages"
     if ansi_enabled() and rich_available():
         from rich import box
         from rich.console import Console
@@ -896,11 +1009,11 @@ def print_chat_header(config: dict[str, Any], renderer: str, context: str) -> No
         )
         grid.add_row(
             f"[bold {palette['success']}]renderer[/] [{palette['foreground']}]{shell_quote_label(renderer)}[/]",
-            f"[bold {palette['warning']}]context[/] [{palette['foreground']}]{context_state}[/]",
+            f"[bold {palette['warning']}]context[/] [{palette['foreground']}]{shell_quote_label(context_status)}[/]",
         )
         grid.add_row(
             f"[dim {palette['muted']}]exit[/] [{palette['foreground']}]/q[/] [dim {palette['muted']}]or[/] [{palette['foreground']}]:q[/]",
-            f"[dim {palette['muted']}]memory[/] [{palette['foreground']}]in-pane turns[/]",
+            f"[dim {palette['muted']}]memory[/] [{palette['foreground']}]{shell_quote_label(memory_status)}[/]",
         )
         Console(force_terminal=True, color_system="truecolor", width=terminal_width()).print(
             Panel(
@@ -916,9 +1029,11 @@ def print_chat_header(config: dict[str, Any], renderer: str, context: str) -> No
 
     if not ansi_enabled():
         print("AI Commander chat pane. Type /q, :q, quit, or exit to close.", flush=True)
+        print(f"Provider: {provider}", flush=True)
+        print(f"Model: {model}", flush=True)
         print(f"Renderer: {renderer}", flush=True)
-        if context.strip():
-            print("Selected pane text will be included as context.", flush=True)
+        print(f"Context: {context_status}", flush=True)
+        print(f"History: {history_count} messages", flush=True)
         return
 
     width = max(52, min(terminal_width(), 96))
@@ -927,7 +1042,8 @@ def print_chat_header(config: dict[str, Any], renderer: str, context: str) -> No
     bottom = "╰" + "─" * (width - 2) + "╯"
     lines = [
         f"Provider: {provider}  Model: {model}",
-        f"Renderer: {renderer}  Context: {context_state}",
+        f"Renderer: {renderer}  Context: {context_status}",
+        f"History: {history_count} messages",
         "Exit: /q, :q, q, quit, exit",
     ]
     print(hex_ansi(top, palette["accent2"], bold=True))
@@ -979,15 +1095,24 @@ def run_chat(args: argparse.Namespace) -> int:
     )
     renderer = str(config.get("renderer") or "raw markdown")
     theme = config.get("theme")
-    print_chat_header(config, renderer, context)
+    transcript: list[dict[str, str]] = []
+    print_chat_header(config, renderer, context, len(history))
     print_prompt(theme)
     for line in sys.stdin:
         prompt = line.rstrip("\n")
         if not prompt:
             print_prompt(theme)
             continue
-        if prompt.strip() in ("/q", ":q", "q", "quit", "exit"):
+        stripped = prompt.strip()
+        if stripped in ("/q", ":q", "q", "quit", "exit"):
             break
+        if stripped.startswith("/") and stripped != "/":
+            handled, history, transcript = handle_chat_command(
+                stripped, config, context, history, transcript
+            )
+            if handled:
+                print_prompt(theme)
+                continue
         user_content = contextual_prompt(prompt, context)
         messages = history + [{"role": "user", "content": user_content}]
         writer = DeltaWriter(config.get("renderer"), theme)
@@ -995,6 +1120,7 @@ def run_chat(args: argparse.Namespace) -> int:
             print_assistant_start(theme)
         assistant_parts: list[str] = []
         request_ok = False
+        request_cancelled = False
         try:
             provider, response, _streamed = post(
                 config,
@@ -1009,6 +1135,9 @@ def run_chat(args: argparse.Namespace) -> int:
                 assistant_parts.append(delta)
                 writer.write(delta)
             request_ok = True
+        except KeyboardInterrupt:
+            request_cancelled = True
+            print("\n# AI response cancelled\nChat remains open.", flush=True)
         except BackendError as exc:
             print(f"\n# AI request failed\n{exc}", flush=True)
         finally:
@@ -1023,8 +1152,16 @@ def run_chat(args: argparse.Namespace) -> int:
                     {"role": "assistant", "content": assistant_text},
                 ]
             )
+            transcript.extend(
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": assistant_text},
+                ]
+            )
             history = trim_history(history, config.get("max_conversation_messages"))
             save_history(config, history)
+        elif request_cancelled:
+            assistant_parts.clear()
         print_prompt(theme)
     return 0
 
