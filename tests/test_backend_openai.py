@@ -313,6 +313,110 @@ def test_debug_json_redacts_tokens_and_summarizes_history():
                 os.environ["WEZTERM_AI_COMMANDER_DEBUG_DIR"] = old_dir
 
 
+def test_chat_truncates_selected_context_before_provider_request():
+    backend = load_backend()
+    calls = []
+
+    class FakeResponse:
+        def iter_lines(self, **kwargs):
+            yield b'data: {"type":"response.output_text.delta","delta":"answer"}'
+
+    def fake_post(config, system, messages, *, stream, max_tokens):
+        calls.append(messages)
+        return "openai", FakeResponse(), True
+
+    backend.post = fake_post
+    config = {
+        "provider": "openai",
+        "renderer": "cat",
+        "chat_system_prompt": "sys",
+        "conversation_continuity": False,
+        "max_chat_context_chars": 5,
+    }
+
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as config_file, tempfile.NamedTemporaryFile("w+", encoding="utf-8") as context_file:
+        json.dump(config, config_file)
+        config_file.flush()
+        context_file.write("abcdefghi")
+        context_file.flush()
+        args = type("Args", (), {"config": config_file.name, "context": context_file.name})()
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO("ask\n/q\n")
+        stdout = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout):
+                assert backend.run_chat(args) == 0
+        finally:
+            sys.stdin = old_stdin
+
+    output = stdout.getvalue()
+    assert "Context: selected, 5 chars" in output
+    assert "Selected context truncated from 9 to 5 chars." in output
+    assert calls == [[{"role": "user", "content": "ask\n\nContext:\nabcde"}]]
+
+
+def test_chat_trims_persisted_history_content_before_provider_request():
+    backend = load_backend()
+    calls = []
+
+    class FakeResponse:
+        def iter_lines(self, **kwargs):
+            yield b'data: {"type":"response.output_text.delta","delta":"answer"}'
+
+    def fake_post(config, system, messages, *, stream, max_tokens):
+        calls.append(messages)
+        return "openai", FakeResponse(), True
+
+    backend.post = fake_post
+    old_stdin = sys.stdin
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / "conversation.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "messages": [
+                        {"role": "user", "content": "old-user"},
+                        {"role": "assistant", "content": "old-assistant"},
+                        {"role": "user", "content": "recent-user"},
+                        {"role": "assistant", "content": "recent-assistant"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        config = {
+            "provider": "openai",
+            "renderer": "cat",
+            "chat_system_prompt": "sys",
+            "conversation_continuity": True,
+            "conversation_state_file": str(state_path),
+            "max_chat_history_messages": 3,
+            "max_chat_history_chars": 19,
+        }
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as config_file, tempfile.NamedTemporaryFile("w+", encoding="utf-8") as context_file:
+            json.dump(config, config_file)
+            config_file.flush()
+            context_file.flush()
+            args = type("Args", (), {"config": config_file.name, "context": context_file.name})()
+            sys.stdin = io.StringIO("ask\n/q\n")
+            stdout = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(stdout):
+                    assert backend.run_chat(args) == 0
+            finally:
+                sys.stdin = old_stdin
+
+        output = stdout.getvalue()
+        assert "Chat history trimmed from 4 messages/48 chars to 2 messages/19 chars." in output
+        assert calls[0] == [
+            {"role": "user", "content": "ser"},
+            {"role": "assistant", "content": "recent-assistant"},
+            {"role": "user", "content": "ask"},
+        ]
+        saved_messages = json.loads(state_path.read_text(encoding="utf-8"))["messages"]
+        assert [item["content"] for item in saved_messages] == ["-assistant", "ask", "answer"]
+
+
 def test_backend_parser_exposes_explicit_setup_without_running_pip():
     backend = load_backend()
     parser = backend.build_parser()
@@ -330,5 +434,7 @@ if __name__ == "__main__":
     test_chat_ctrl_c_cancels_response_and_keeps_loop_alive()
     test_rich_renderer_uses_live_markdown_updates()
     test_debug_json_redacts_tokens_and_summarizes_history()
+    test_chat_truncates_selected_context_before_provider_request()
+    test_chat_trims_persisted_history_content_before_provider_request()
     test_backend_parser_exposes_explicit_setup_without_running_pip()
     print("ok")
