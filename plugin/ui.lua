@@ -1240,11 +1240,20 @@ local function run_chat_backend(pane, window, config, context)
     local args, err = chat_backend_args(config, context)
     if not args then return err end
 
+    local target_pane_id = nil
+    if target.pane_id then
+        local ok_id, pane_id = pcall(function() return target:pane_id() end)
+        if ok_id and pane_id ~= nil then target_pane_id = tostring(pane_id) end
+    end
+
     local ok, new_pane = pcall(function()
         return target:split {
             direction = 'Bottom',
             args = args,
             size = config.chat_pane_size,
+            set_environment_variables = {
+                WEZTERM_AI_COMMANDER_TARGET_PANE_ID = target_pane_id or '',
+            },
         }
     end)
     if not ok then

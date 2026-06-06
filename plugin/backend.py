@@ -1165,6 +1165,191 @@ def context_summary(context: str) -> tuple[str, str]:
     return f"selected, {char_count} chars, {line_count} lines", preview
 
 
+SHELL_FENCE_RE = re.compile(r"```([A-Za-z0-9_-]*)[^\n]*\n(.*?)```", re.S)
+SHELL_FENCE_LANGUAGES = {"", "sh", "shell", "bash", "zsh", "fish"}
+SHELL_SNIPPET_COMMANDS = {
+    "awk",
+    "bun",
+    "cargo",
+    "cd",
+    "chmod",
+    "chown",
+    "cp",
+    "curl",
+    "docker",
+    "git",
+    "go",
+    "grep",
+    "jq",
+    "kubectl",
+    "lua",
+    "make",
+    "mkdir",
+    "mv",
+    "node",
+    "npm",
+    "pnpm",
+    "python",
+    "python3",
+    "rm",
+    "rsync",
+    "sudo",
+    "tar",
+    "uv",
+    "wget",
+    "yarn",
+}
+
+
+def strip_shell_prompt(line: str) -> str:
+    return re.sub(r"^\s*(?:[$#❯>]|\w+@\S+[:\w/.-]*[$#])\s+", "", line).strip()
+
+
+def first_shell_word_py(line: str) -> tuple[str | None, str]:
+    rest = strip_shell_prompt(line)
+    while True:
+        next_rest = re.sub(r"^[A-Za-z_][A-Za-z0-9_]*=\S+\s+", "", rest, count=1)
+        if next_rest == rest:
+            break
+        rest = next_rest
+    for prefix in ("sudo ", "command "):
+        if rest.startswith(prefix):
+            rest = rest[len(prefix) :].lstrip()
+    match = re.match(r"([\w./-]+)", rest)
+    return (match.group(1), rest) if match else (None, rest)
+
+
+def is_dangerous_command(command: str) -> bool:
+    text = str(command or "").lower()
+    if not text:
+        return False
+    for line in text.splitlines():
+        word, rest = first_shell_word_py(line)
+        if not word:
+            continue
+        word = word.rsplit("/", 1)[-1]
+        if word in {"rm", "dd", "shutdown", "reboot", "kill", "pkill", "drop"} or word.startswith("mkfs"):
+            return True
+        if word == "git":
+            if re.search(r"\bclean\b", rest):
+                return True
+            if re.search(r"\breset\b", rest) and "--hard" in rest:
+                return True
+    return bool(re.search(r"\bdrop\s+(?:table|database)\b", text))
+
+
+def is_plain_command_snippet(line: str) -> bool:
+    command = strip_shell_prompt(line)
+    if not command or "\n" in command:
+        return False
+    if command.startswith(("-", "*", "`")) or command.endswith(":"):
+        return False
+    word, _rest = first_shell_word_py(command)
+    if not word:
+        return False
+    word = word.rsplit("/", 1)[-1]
+    return word in SHELL_SNIPPET_COMMANDS
+
+
+def normalize_command_text(command: str) -> str:
+    lines = [strip_shell_prompt(line) for line in str(command or "").strip().splitlines()]
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def extract_shell_commands(text: str) -> list[str]:
+    commands: list[str] = []
+    covered: list[tuple[int, int]] = []
+    seen: set[str] = set()
+    for match in SHELL_FENCE_RE.finditer(text or ""):
+        lang = (match.group(1) or "").strip().lower()
+        covered.append(match.span())
+        if lang not in SHELL_FENCE_LANGUAGES:
+            continue
+        command = normalize_command_text(match.group(2))
+        if command and command not in seen:
+            commands.append(command)
+            seen.add(command)
+    for line_match in re.finditer(r"^.*$", text or "", re.M):
+        start = line_match.start()
+        if any(a <= start < b for a, b in covered):
+            continue
+        command = normalize_command_text(line_match.group(0))
+        if command and command not in seen and is_plain_command_snippet(command):
+            commands.append(command)
+            seen.add(command)
+    return commands
+
+
+def print_command_hint(new_commands: list[str]) -> None:
+    if not new_commands:
+        return
+    noun = "command" if len(new_commands) == 1 else "commands"
+    print(f"Commands: found {len(new_commands)} {noun}. Use /insert N, /copy N, /run N.", flush=True)
+
+
+def copy_text_osc52(text: str) -> bool:
+    if not text or not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
+        return False
+    encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    sys.stdout.write(f"\x1b]52;c;{encoded}\a\n")
+    sys.stdout.flush()
+    return True
+
+
+def parse_command_number(command: str, name: str, commands: list[str]) -> tuple[int | None, str | None]:
+    parts = command.strip().split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip().isdigit():
+        return None, f"Usage: {name} N"
+    index = int(parts[1])
+    if index < 1 or index > len(commands):
+        return None, f"Invalid command number: {index}"
+    return index, None
+
+
+def copy_extracted_command(command: str) -> None:
+    if copy_text_osc52(command):
+        print("Command copied with OSC 52.", flush=True)
+    else:
+        print("Command copy unsupported in this terminal/session. Copy manually:", flush=True)
+        print(command, flush=True)
+
+
+def target_pane_id() -> str | None:
+    value = os.environ.get("WEZTERM_AI_COMMANDER_TARGET_PANE_ID")
+    if is_non_empty(value) and value.strip().isdigit():
+        return value.strip()
+    return None
+
+
+def send_command_to_target(command: str, commands: list[str], index: int) -> None:
+    pane_id = target_pane_id()
+    if not pane_id:
+        print("Target pane unavailable; falling back to copy.", flush=True)
+        copy_extracted_command(command)
+        return
+    try:
+        subprocess.run(
+            ["wezterm", "cli", "send-text", "--pane-id", pane_id, command],
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"Insert failed: {exc}", flush=True)
+        copy_extracted_command(command)
+        return
+    print(f"Inserted command {index} into target pane.", flush=True)
+
+
+def run_extracted_command(command: str, index: int) -> None:
+    print(f"Running command {index}:", flush=True)
+    print(command, flush=True)
+    try:
+        completed = subprocess.run(command, shell=True)
+    except OSError as exc:
+        print(f"Run failed: {exc}", flush=True)
+        return
+    if completed.returncode != 0:
+        print(f"Command exited with status {completed.returncode}.", flush=True)
+
 def transcript_text(transcript: list[dict[str, str]]) -> str:
     parts: list[str] = []
     for item in transcript:
@@ -1310,41 +1495,87 @@ def handle_chat_command(
     context: str,
     history: list[dict[str, str]],
     transcript: list[dict[str, str]],
-) -> tuple[bool, list[dict[str, str]], list[dict[str, str]]]:
+    commands: list[str],
+    pending_confirmation: dict[str, Any] | None,
+) -> tuple[bool, list[dict[str, str]], list[dict[str, str]], dict[str, Any] | None]:
     name = command.strip().split(maxsplit=1)[0]
+    if pending_confirmation is not None:
+        expected = str(pending_confirmation["confirm"])
+        if command.strip() == expected:
+            index = int(pending_confirmation["index"])
+            pending_command = str(pending_confirmation["command"])
+            if pending_confirmation["action"] == "insert":
+                send_command_to_target(pending_command, commands, index)
+            else:
+                run_extracted_command(pending_command, index)
+        else:
+            print(f"Cancelled {pending_confirmation['action']} command {pending_confirmation['index']}.", flush=True)
+        return True, history, transcript, None
     if name == "/clear":
         history = []
         transcript = []
         save_history(config, history)
         print("Chat history cleared.", flush=True)
-        return True, history, transcript
+        return True, history, transcript, pending_confirmation
     if name == "/context":
         summary, preview = context_summary(context)
         print(f"Context: {summary}", flush=True)
         if preview:
             print(f"Preview: {preview}", flush=True)
-        return True, history, transcript
+        return True, history, transcript, pending_confirmation
     if name == "/model":
         provider = str(config.get("provider") or DEFAULT_CONFIG["provider"])
         print(f"Model: {model_for(config, provider)}", flush=True)
-        return True, history, transcript
+        return True, history, transcript, pending_confirmation
     if name == "/provider":
         print(provider_status(config), flush=True)
-        return True, history, transcript
+        return True, history, transcript, pending_confirmation
     if name == "/save":
         path = save_transcript(transcript)
         print(f"Transcript saved: {path}", flush=True)
-        return True, history, transcript
+        return True, history, transcript, pending_confirmation
     if name == "/load":
         history, transcript = handle_load_command(command, config, history, transcript)
-        return True, history, transcript
+        return True, history, transcript, pending_confirmation
     if name == "/copy":
-        if copy_transcript_osc52(transcript):
-            print("Transcript copied with OSC 52.", flush=True)
+        if command.strip() == "/copy":
+            if copy_transcript_osc52(transcript):
+                print("Transcript copied with OSC 52.", flush=True)
+            else:
+                print("Transcript copy unsupported in this terminal/session; use /save instead.", flush=True)
+            return True, history, transcript, pending_confirmation
+        index, error = parse_command_number(command, "/copy", commands)
+        if error:
+            print(error, flush=True)
+            return True, history, transcript, pending_confirmation
+        copy_extracted_command(commands[index - 1])
+        return True, history, transcript, pending_confirmation
+    if name in ("/insert", "/run"):
+        index, error = parse_command_number(command, name, commands)
+        if error:
+            print(error, flush=True)
+            return True, history, transcript, pending_confirmation
+        selected = commands[index - 1]
+        action_name = name[1:]
+        if is_dangerous_command(selected):
+            confirmation = f"{action_name} {index}"
+            print(
+                f"Dangerous command {index}. Type '{confirmation}' to confirm or anything else to cancel.",
+                flush=True,
+            )
+            return True, history, transcript, {
+                "action": action_name,
+                "index": index,
+                "command": selected,
+                "confirm": confirmation,
+            }
+        if name == "/insert":
+            send_command_to_target(selected, commands, index)
         else:
-            print("Transcript copy unsupported in this terminal/session; use /save instead.", flush=True)
-        return True, history, transcript
-    return False, history, transcript
+            print("Safe command; running now.", flush=True)
+            run_extracted_command(selected, index)
+        return True, history, transcript, pending_confirmation
+    return False, history, transcript, pending_confirmation
 
 
 def print_chat_header(config: dict[str, Any], renderer: str, context: str, history_count: int) -> None:
@@ -1465,6 +1696,8 @@ def run_chat(args: argparse.Namespace) -> int:
     renderer = str(config.get("renderer") or "raw markdown")
     theme = config.get("theme")
     transcript: list[dict[str, str]] = []
+    commands: list[str] = []
+    pending_confirmation: dict[str, Any] | None = None
     print_chat_header(config, renderer, context, len(history))
     if context_trimmed:
         print(
@@ -1479,11 +1712,11 @@ def run_chat(args: argparse.Namespace) -> int:
             print_prompt(theme)
             continue
         stripped = prompt.strip()
-        if stripped in ("/q", ":q", "q", "quit", "exit"):
+        if stripped in ("/q", ":q", "q", "quit", "exit") and pending_confirmation is None:
             break
-        if stripped.startswith("/") and stripped != "/":
-            handled, history, transcript = handle_chat_command(
-                stripped, config, context, history, transcript
+        if (stripped.startswith("/") and stripped != "/") or pending_confirmation is not None:
+            handled, history, transcript, pending_confirmation = handle_chat_command(
+                stripped, config, context, history, transcript, commands, pending_confirmation
             )
             if handled:
                 print_prompt(theme)
@@ -1533,6 +1766,10 @@ def run_chat(args: argparse.Namespace) -> int:
                     {"role": "assistant", "content": assistant_text},
                 ]
             )
+            new_commands = extract_shell_commands(assistant_text)
+            if new_commands:
+                commands = new_commands + commands
+                print_command_hint(new_commands)
             history, _history_trim_stats = trim_chat_history(history, config)
             save_history(config, history)
         elif request_cancelled:

@@ -252,6 +252,112 @@ def test_chat_ctrl_c_cancels_response_and_keeps_loop_alive():
     assert calls[1] == [{"role": "user", "content": "second"}]
 
 
+def test_chat_extracts_commands_copy_insert_run_and_invalid_number():
+    backend = load_backend()
+    run_calls = []
+
+    class FakeResponse:
+        def iter_lines(self, **kwargs):
+            text = "Use this:\n```bash\nprintf hi\nprintf bye\n```"
+            yield ('data: {"type":"response.output_text.delta","delta":' + json.dumps(text) + '}').encode()
+
+    def fake_post(config, system, messages, *, stream, max_tokens):
+        return "openai", FakeResponse(), True
+
+    def fake_run(args, **kwargs):
+        run_calls.append((args, kwargs))
+        return type("Completed", (), {"returncode": 0})()
+
+    backend.post = fake_post
+    backend.subprocess.run = fake_run
+    old_env = dict(os.environ)
+    old_stdin = sys.stdin
+    config = {
+        "provider": "openai",
+        "renderer": "cat",
+        "chat_system_prompt": "sys",
+        "max_conversation_messages": 12,
+        "conversation_continuity": False,
+    }
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as config_file, tempfile.NamedTemporaryFile("w+", encoding="utf-8") as context_file:
+        json.dump(config, config_file)
+        config_file.flush()
+        context_file.flush()
+        args = type("Args", (), {"config": config_file.name, "context": context_file.name})()
+        os.environ["WEZTERM_AI_COMMANDER_TARGET_PANE_ID"] = "42"
+        sys.stdin = io.StringIO("first\n/copy 1\n/insert 9\n/insert 1\n/run 1\n/q\n")
+        stdout = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout):
+                assert backend.run_chat(args) == 0
+        finally:
+            sys.stdin = old_stdin
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    output = stdout.getvalue()
+    assert "Commands: found 1 command. Use /insert N, /copy N, /run N." in output
+    assert "Command copy unsupported" in output
+    assert "printf hi\nprintf bye" in output
+    assert "Invalid command number: 9" in output
+    assert run_calls[0][0] == ["wezterm", "cli", "send-text", "--pane-id", "42", "printf hi\nprintf bye"]
+    assert run_calls[0][1] == {"check": True}
+    assert run_calls[1][0] == "printf hi\nprintf bye"
+    assert run_calls[1][1] == {"shell": True}
+
+
+def test_chat_dangerous_insert_and_run_require_confirmation_and_cancel():
+    backend = load_backend()
+    run_calls = []
+
+    class FakeResponse:
+        def iter_lines(self, **kwargs):
+            text = "Careful:\n```sh\nrm -rf /tmp/ai-commander-test\n```"
+            yield ('data: {"type":"response.output_text.delta","delta":' + json.dumps(text) + '}').encode()
+
+    def fake_post(config, system, messages, *, stream, max_tokens):
+        return "openai", FakeResponse(), True
+
+    def fake_run(args, **kwargs):
+        run_calls.append((args, kwargs))
+        return type("Completed", (), {"returncode": 0})()
+
+    backend.post = fake_post
+    backend.subprocess.run = fake_run
+    old_env = dict(os.environ)
+    old_stdin = sys.stdin
+    config = {
+        "provider": "openai",
+        "renderer": "cat",
+        "chat_system_prompt": "sys",
+        "max_conversation_messages": 12,
+        "conversation_continuity": False,
+    }
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8") as config_file, tempfile.NamedTemporaryFile("w+", encoding="utf-8") as context_file:
+        json.dump(config, config_file)
+        config_file.flush()
+        context_file.flush()
+        args = type("Args", (), {"config": config_file.name, "context": context_file.name})()
+        os.environ["WEZTERM_AI_COMMANDER_TARGET_PANE_ID"] = "7"
+        sys.stdin = io.StringIO("first\n/insert 1\ncancel\n/run 1\nrun 1\n/q\n")
+        stdout = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout):
+                assert backend.run_chat(args) == 0
+        finally:
+            sys.stdin = old_stdin
+            os.environ.clear()
+            os.environ.update(old_env)
+
+    output = stdout.getvalue()
+    assert "Dangerous command 1. Type 'insert 1' to confirm" in output
+    assert "Cancelled insert command 1." in output
+    assert "Dangerous command 1. Type 'run 1' to confirm" in output
+    assert len(run_calls) == 1
+    assert run_calls[0][0] == "rm -rf /tmp/ai-commander-test"
+    assert run_calls[0][1] == {"shell": True}
+
+
 def test_rich_renderer_uses_live_markdown_updates():
     backend = load_backend()
     assert backend.rich_available()
@@ -432,6 +538,8 @@ if __name__ == "__main__":
     test_chat_prints_header_ignores_blank_and_keeps_history()
     test_chat_slash_commands_save_copy_and_clear_without_leaking_tokens()
     test_chat_ctrl_c_cancels_response_and_keeps_loop_alive()
+    test_chat_extracts_commands_copy_insert_run_and_invalid_number()
+    test_chat_dangerous_insert_and_run_require_confirmation_and_cancel()
     test_rich_renderer_uses_live_markdown_updates()
     test_debug_json_redacts_tokens_and_summarizes_history()
     test_chat_truncates_selected_context_before_provider_request()

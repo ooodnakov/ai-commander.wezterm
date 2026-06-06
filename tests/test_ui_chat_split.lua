@@ -97,9 +97,11 @@ local pane = {
         split_opts = opts
         assert_equal(opts.direction, 'Bottom', 'ask chat opens a bottom split')
         assert_equal(opts.size, 0.5, 'ask chat uses configured split size')
+        assert_equal(opts.set_environment_variables.WEZTERM_AI_COMMANDER_TARGET_PANE_ID, '42', 'ask chat passes original pane id')
         return {}
     end,
     send_text = function() end,
+    pane_id = function() return 42 end,
 }
 
 local window = {
