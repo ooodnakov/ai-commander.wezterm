@@ -47,6 +47,9 @@ local config = {
     conversation_continuity = false, -- keep ask-mode context across turns
     conversation_state_file = wezterm.home_dir .. '/.wezterm_ai_conversation_state.json',
     max_conversation_messages = 12, -- Claude continuity keeps this many recent messages
+    max_chat_context_chars = 120000, -- truncate selected chat context above this many chars; 0 disables
+    max_chat_history_messages = 12, -- keep this many recent persisted chat messages; 0 disables
+    max_chat_history_chars = 120000, -- keep this many chars from recent persisted chat history; 0 disables
     temperature = 0.1,
     command_count = 5, -- Number of commands to generate (default: 5)
     history_file = wezterm.home_dir .. '/.wezterm_ai_prompt_history.txt',
@@ -161,6 +164,9 @@ function M.apply(plugin_config)
     if plugin_config then
         for key, value in pairs(plugin_config) do
             config[key] = shallow_merge(config[key], value)
+        end
+        if plugin_config.max_conversation_messages ~= nil and plugin_config.max_chat_history_messages == nil then
+            config.max_chat_history_messages = plugin_config.max_conversation_messages
         end
     end
 

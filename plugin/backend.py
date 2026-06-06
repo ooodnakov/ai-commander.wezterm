@@ -50,6 +50,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "conversation_continuity": False,
     "conversation_state_file": str(Path.home() / ".wezterm_ai_conversation_state.json"),
     "max_conversation_messages": 12,
+    "max_chat_context_chars": 120000,
+    "max_chat_history_messages": 12,
+    "max_chat_history_chars": 120000,
     "temperature": 0.1,
     "chat_system_prompt": "\n".join(
         [
@@ -201,7 +204,10 @@ def load_config(path: str | Path) -> dict[str, Any]:
     value = load_json(path)
     if not isinstance(value, dict):
         raise BackendError("Config JSON must be an object")
-    return deep_merge(DEFAULT_CONFIG, value)
+    merged = deep_merge(DEFAULT_CONFIG, value)
+    if "max_chat_history_messages" not in value and "max_conversation_messages" in value:
+        merged["max_chat_history_messages"] = value["max_conversation_messages"]
+    return merged
 
 
 def read_text(path: str | Path) -> str:
@@ -953,14 +959,80 @@ def run_generate(args: argparse.Namespace) -> int:
     return 0
 
 
-def trim_history(history: list[dict[str, str]], limit: Any) -> list[dict[str, str]]:
+def positive_int(value: Any, default: int = 0) -> int:
     try:
-        max_messages = int(limit)
+        parsed = int(value)
     except (TypeError, ValueError):
-        max_messages = 12
+        return default
+    return parsed if parsed > 0 else 0
+
+
+def truncate_text(value: str, limit: Any) -> tuple[str, bool]:
+    max_chars = positive_int(limit)
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value, False
+    return value[:max_chars], True
+
+
+def chat_history_message_limit(config: dict[str, Any]) -> Any:
+    value = config.get("max_chat_history_messages")
+    if value is not None:
+        return value
+    return config.get("max_conversation_messages")
+
+
+def trim_history(history: list[dict[str, str]], limit: Any) -> list[dict[str, str]]:
+    max_messages = positive_int(limit, 12)
     if max_messages <= 0 or len(history) <= max_messages:
         return history
     return history[-max_messages:]
+
+
+def history_content_chars(history: list[dict[str, str]]) -> int:
+    return sum(len(str(item.get("content") or "")) for item in history)
+
+
+def trim_history_content(
+    history: list[dict[str, str]], limit: Any
+) -> tuple[list[dict[str, str]], bool]:
+    max_chars = positive_int(limit)
+    if max_chars <= 0:
+        return history, False
+    remaining = max_chars
+    trimmed_reversed: list[dict[str, str]] = []
+    changed = False
+    for item in reversed(history):
+        content = str(item.get("content") or "")
+        if remaining <= 0:
+            changed = True
+            break
+        if len(content) > remaining:
+            content = content[-remaining:]
+            changed = True
+        remaining -= len(content)
+        trimmed_reversed.append({"role": str(item.get("role") or ""), "content": content})
+    trimmed = list(reversed(trimmed_reversed))
+    return trimmed, changed or len(trimmed) != len(history)
+
+
+def trim_chat_history(
+    history: list[dict[str, str]], config: dict[str, Any]
+) -> tuple[list[dict[str, str]], dict[str, int]]:
+    before_messages = len(history)
+    before_chars = history_content_chars(history)
+    trimmed = trim_history(history, chat_history_message_limit(config))
+    trimmed, content_changed = trim_history_content(trimmed, config.get("max_chat_history_chars"))
+    after_messages = len(trimmed)
+    after_chars = history_content_chars(trimmed)
+    stats = {
+        "before_messages": before_messages,
+        "after_messages": after_messages,
+        "before_chars": before_chars,
+        "after_chars": after_chars,
+    }
+    if before_messages == after_messages and before_chars == after_chars and not content_changed:
+        stats = {}
+    return trimmed, stats
 
 
 def load_history(config: dict[str, Any]) -> list[dict[str, str]]:
@@ -1282,10 +1354,21 @@ def print_assistant_start(theme: Any = None) -> None:
         return
     print("AI:", flush=True)
 
+def print_history_trim_warning(stats: dict[str, int]) -> None:
+    if not stats:
+        return
+    print(
+        "Chat history trimmed from "
+        f"{stats['before_messages']} messages/{stats['before_chars']} chars to "
+        f"{stats['after_messages']} messages/{stats['after_chars']} chars.",
+        flush=True,
+    )
+
 
 def run_chat(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    context = read_text(args.context)
+    original_context = read_text(args.context)
+    context, context_trimmed = truncate_text(original_context, config.get("max_chat_context_chars"))
     if getattr(args, "delete_input_files", False):
         for path in (args.config, args.context):
             try:
@@ -1295,13 +1378,17 @@ def run_chat(args: argparse.Namespace) -> int:
     system = str(
         config.get("chat_system_prompt") or DEFAULT_CONFIG["chat_system_prompt"]
     )
-    history = trim_history(
-        load_history(config), config.get("max_conversation_messages")
-    )
+    history, history_trim_stats = trim_chat_history(load_history(config), config)
     renderer = str(config.get("renderer") or "raw markdown")
     theme = config.get("theme")
     transcript: list[dict[str, str]] = []
     print_chat_header(config, renderer, context, len(history))
+    if context_trimmed:
+        print(
+            f"Selected context truncated from {len(original_context)} to {len(context)} chars.",
+            flush=True,
+        )
+    print_history_trim_warning(history_trim_stats)
     print_prompt(theme)
     for line in sys.stdin:
         prompt = line.rstrip("\n")
@@ -1363,7 +1450,7 @@ def run_chat(args: argparse.Namespace) -> int:
                     {"role": "assistant", "content": assistant_text},
                 ]
             )
-            history = trim_history(history, config.get("max_conversation_messages"))
+            history, _history_trim_stats = trim_chat_history(history, config)
             save_history(config, history)
         elif request_cancelled:
             assistant_parts.clear()
